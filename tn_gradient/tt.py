@@ -167,7 +167,7 @@ class TensorTrain:
 
             cores.append(new_core)
 
-        return TensorTrain.from_cores(cores)
+        return TensorTrain.from_cores(cores)        
 
     def __rmul__(self, constant):
         subconstant = constant ** (1 / self.order)
