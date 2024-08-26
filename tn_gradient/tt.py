@@ -14,7 +14,7 @@ class TensorTrain:
 
         self.device = device
         
-        self.cores = [torch.zeros((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(self.order)]
+        self.cores = [torch.empty((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(self.order)]
         if device:
             for core in self.cores:
                 core.data = core.data.to(device)
