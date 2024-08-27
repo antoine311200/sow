@@ -61,7 +61,8 @@ class TensorTrain:
         return self
     
     def clone(self):
-        tt = TensorTrain(self.ranks.copy(), self.in_shape.copy(), self.out_shape.copy())
+        print(self.ranks, self.in_shape, self.out_shape)
+        tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
         tt.cores = [core.clone() for core in self.cores]
         return tt
 
@@ -192,7 +193,7 @@ class TensorTrain:
             TensorTrain: The tensor train with the constant added
         """
         n_inner_params = torch.prod(torch.tensor(self.ranks))
-        subconstant = (constant / n_inner_params)
+        subconstant = constant / n_inner_params
         return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape)
 
     def __add__(self, other):
@@ -252,8 +253,10 @@ class TensorTrain:
         Returns:
             TensorTrain: The tensor train resulting from the multiplication
         """
+        is_neg = constant < 0
+        constant = abs(constant)
         subconstant = constant ** (1 / self.order)
-        cores = [core * subconstant for core in self.cores]
+        cores = [core * ((-1 if is_neg else 1) * subconstant) for core in self.cores]
         return TensorTrain.from_cores(cores)
 
     def __mul__(self, other):
