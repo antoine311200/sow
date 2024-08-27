@@ -42,7 +42,15 @@ class TensorTrain:
     
     @staticmethod
     def zeros(ranks, in_shape, out_shape):
-        return TensorTrain(ranks, in_shape, out_shape)
+        tt = TensorTrain(ranks, in_shape, out_shape)
+        tt.cores = [torch.zeros((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+        return tt
+    
+    @staticmethod
+    def ones(ranks, in_shape, out_shape):
+        tt = TensorTrain(ranks, in_shape, out_shape)
+        tt.cores = [torch.ones((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+        return tt
 
     def numel(self):
         return sum(core.numel() for core in self.cores)
@@ -146,6 +154,11 @@ class TensorTrain:
             struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
         struct.append(in_axis+out_axis)
         return contract(*struct)
+
+    def add_(self, constant):
+        n_inner_params = torch.prod(torch.tensor(self.ranks))
+        subconstant = (constant / n_inner_params)
+        return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape)
 
     def __add__(self, other):
         cores = []
