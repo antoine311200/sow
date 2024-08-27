@@ -66,7 +66,21 @@ class TensorTrain:
         return tt
 
     def decompose(self, tensor: torch.Tensor):
-        """Decompose a tensor into a tensor train"""
+        """Decompose a tensor into a tensor train.
+        
+        The decomposition is performed by iteratives truncated QR decomposition of the tensor.
+        At each step, the current tensor is reshaped into a matrix whose rows correspond to the
+        left rank, input and output dimensios of the current core.
+        A QR decomposition is then performed on this matrix with a truncation to respect the tt-ranks.
+        The left matrix is reshaped to the core shape and the right matrix is kept for the next step as
+        the remaining tensor elements to decompose further.
+        
+        Args:
+            tensor (torch.Tensor): The tensor to decompose
+            
+        Returns:
+            TensorTrain: The tensor train resulting from the decomposition
+        """
         for k in range(self.order - 1):
             L = tensor.reshape(self.ranks[k] * self.in_shape[k] * self.out_shape[k], -1)
             Q, R = torch.linalg.qr(L, mode="complete")
@@ -144,8 +158,17 @@ class TensorTrain:
             tt.round(new_ranks, inplace=True)
             return tt
 
-    def reconstruct(self):
-        """Reconstruct the tensor from the tensor train"""
+    def reconstruct(self) -> torch.Tensor:
+        """Reconstruct the tensor from the tensor train.
+        
+        The reconstruction is done by contracting the cores of the tensor train
+        one by one on the bond indices.
+        The einstein summation notation is:
+            C(i1, ..., in, j1, ..., jm) = C1(r0, i1, j1, r1) * ... * Cn(rn-1, in, jn, rn)
+        
+        Returns:
+            torch.Tensor: The reconstructed tensor
+        """
         struct = []
         in_axis = [f"in_{i}" for i in range(self.order)]
         out_axis = [f"out_{i}" for i in range(self.order)]
@@ -156,11 +179,43 @@ class TensorTrain:
         return contract(*struct)
 
     def add_(self, constant):
+        """Add a constant to the tensor train, inplace.
+        
+        An element-wise addition is performed on the cores of the tensor train
+        with a corrected constant to account for the number of summed elements
+        as there is r0 * r1 * ... * rn sums performed to reconstruct the tensor.
+
+        Args:
+            constant (float): The constant to add
+            
+        Returns:
+            TensorTrain: The tensor train with the constant added
+        """
         n_inner_params = torch.prod(torch.tensor(self.ranks))
         subconstant = (constant / n_inner_params)
         return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape)
 
     def __add__(self, other):
+        """Add two tensor trains element-wise.
+
+        The addition of two tensor trains results in a new tensor train
+        whose cores are defined by:
+            C_k(i_k, j_k) = block_diag(A_k(i_k, j_k), B_k(i_k, j_k))
+        with the extremal cores being the concatenation of the extremal cores
+        of the two tensor trains along the correct axis.
+
+        In this implementation, we limited the use of for loops on the physical
+        dimensions of the tensor train for performance reasons.
+        Thus, the element-wise addition for each core is summed up as padding
+        the cores along the right axis (for the non-extremal cores) and concatenating
+        them.
+        
+        Args:
+            other (TensorTrain): The tensor train to add
+            
+        Returns:
+        TensorTrain: The tensor train resulting from the element-wise addition
+        """
         cores = []
         for i in range(self.order):
             leftmost = i == 0
@@ -183,11 +238,39 @@ class TensorTrain:
         return TensorTrain.from_cores(cores)        
 
     def __rmul__(self, constant):
+        """Multiply a tensor train by a constant.
+        
+        In order to get a homogeneous multiplication, this implementation multiplies
+        each core of the tensor train by the constant to the power of 1/d where d is the
+        order of the tensor train.
+        The counter part of this operation is that it destroys the orthogonality of the tensor train.
+        However, the orthogonality is not a property that we need to preserve in this work.
+        
+        Args:
+            constant (float): The constant to multiply by
+            
+        Returns:
+            TensorTrain: The tensor train resulting from the multiplication
+        """
         subconstant = constant ** (1 / self.order)
         cores = [core * subconstant for core in self.cores]
         return TensorTrain.from_cores(cores)
 
     def __mul__(self, other):
+        """Multiply two tensor trains element-wise.
+
+        The element-wise multiplication of two tensor trains results in a new tensor train
+        whose cores are defined by the dot product of the aligned cores.
+            C_k(i_k, j_k) = A_k(i_k, j_k) ⊗ B_k(i_k, j_k)
+        To avoid for loops, an einsum contraction is performed directly on the whole cores along
+        the correct axes followed by a reshape to get the new core shape.
+            
+        Args:
+            other (TensorTrain): The tensor train to multiply by
+
+        Returns:
+            TensorTrain: The tensor train resulting from the element-wise multiplication
+        """
         cores = []
         for i in range(self.order):
             left_matrix = self.cores[i]
@@ -200,10 +283,13 @@ class TensorTrain:
         return TensorTrain.from_cores(cores)
 
     def left_matrix(self, index):
+        """Left matrizification of the core at index. C(rk-1, ik, jk, rk) -> C(rk-1 * ik * jk, rk)"""
         return self.cores[index].reshape((self.ranks[index] * self.in_shape[index] * self.out_shape[index], -1))
     
     def right_matrix(self, index):
+        """Right matrizification of the core at index. C(rk, ik, jk, rk+1) -> C(rk, ik * jk * rk+1)"""
         return self.cores[index].reshape((-1, self.in_shape[index] * self.out_shape[index] * self.ranks[index+1]))
     
     def to_core(self, matrix, index):
+        """Reshape a matrix to the core shape at index C(rk, ik, jk, rk+1)"""
         return matrix.reshape((self.ranks[index], self.in_shape[index], self.out_shape[index], self.ranks[index+1]))
