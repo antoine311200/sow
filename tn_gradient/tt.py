@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from math import floor, log
+
 from opt_einsum import contract
 from scipy import linalg
 
@@ -12,12 +14,12 @@ class TensorTrain:
         self.in_shape = in_shape
         self.out_shape = out_shape
 
-        self.device = device
         
         self.cores = [torch.empty((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(self.order)]
         if device:
-            for core in self.cores:
-                core.data = core.data.to(device)
+            self.to(device)
+        else:
+            self.device = self.cores[0].device
 
     @staticmethod
     def from_tensor(tensor: torch.Tensor, ranks: list):
@@ -31,39 +33,46 @@ class TensorTrain:
         return tt
 
     @staticmethod
-    def from_matrix(matrix, rank, order):
-        ranks = [1] + [rank] * (order - 1) + [1]
-
-    @staticmethod
     def from_cores(cores):
-        tt = TensorTrain([core.shape[0] for core in cores] + [1], [core.shape[1] for core in cores], [core.shape[2] for core in cores])
+        tt = TensorTrain(
+            [core.shape[0] for core in cores] + [1],
+            [core.shape[1] for core in cores],
+            [core.shape[2] for core in cores],
+            device=cores[0].device
+        )
         tt.cores = cores
         return tt
     
     @staticmethod
-    def zeros(ranks, in_shape, out_shape):
+    def zeros(ranks, in_shape, out_shape, device):
         tt = TensorTrain(ranks, in_shape, out_shape)
         tt.cores = [torch.zeros((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+        tt.to(device)
         return tt
     
     @staticmethod
-    def ones(ranks, in_shape, out_shape):
+    def ones(ranks, in_shape, out_shape, device):
         tt = TensorTrain(ranks, in_shape, out_shape)
         tt.cores = [torch.ones((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+        tt.to(device)
         return tt
 
     def numel(self):
         return sum(core.numel() for core in self.cores)
     
     def to(self, device):
+        self.device = device
+        if self.cores[0].device == device:
+            return self
+
         for core in self.cores:
             core.data = core.data.to(device)
         return self
     
     def clone(self):
-        print(self.ranks, self.in_shape, self.out_shape)
         tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
         tt.cores = [core.clone() for core in self.cores]
+        tt.to(self.device)
         return tt
 
     def decompose(self, tensor: torch.Tensor):
@@ -178,6 +187,49 @@ class TensorTrain:
             struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
         struct.append(in_axis+out_axis)
         return contract(*struct)
+    
+    def norm(self):
+        """Compute the norm of the tensor train by performing an einsum contraction
+        on the TT and its conjugate."""
+        struct = []
+        for i, core in enumerate(self.cores):
+            struct.append(core)
+            struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
+            struct.append(core)
+            struct.append((f"rank2_{i}", f"in_{i}", f"out_{i}", f"rank2_{i+1}"))
+        return float(contract(*struct).squeeze())
+
+    def sqrt(self):
+        """Compute the element-wise square root of the tensor train
+        using an iterative method.
+        This is a SLOW method and should be used with caution.
+        """
+
+        # Find the maximum value of the tensor train
+        # Then, compute the number of bits to shift the tensor train to the right
+        # This allows the square root algorithm to converge
+        max_value = float(max([core.abs().max() for core in self.cores]))
+        k = floor(log(max_value) / log(4))
+
+        # Scale the tensor train by 1/4^k
+        A = (1/(4**k)) * self.clone()
+        C = A.clone().add_(-1)
+
+        ranks = A.ranks.copy()
+        max_iter = 10
+        while max_iter > 0 and (A - C).norm() > 1e-4:
+            B = A - 1/2 * (A * C)
+            B = B.round(ranks)
+            D = 1/4 * (C * C).round(ranks) * (C.add_(-3))
+            D = D.round(ranks)
+            max_iter -= 1
+            A, C = B, D
+
+        # Scale back the tensor train by 2^k to account for the initial scaling
+        A = 2**k * A
+        return A
+
+
 
     def add_(self, constant):
         """Add a constant to the tensor train, inplace.
@@ -194,7 +246,7 @@ class TensorTrain:
         """
         n_inner_params = torch.prod(torch.tensor(self.ranks))
         subconstant = constant / n_inner_params
-        return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape)
+        return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape, device=self.device)
 
     def __add__(self, other):
         """Add two tensor trains element-wise.
@@ -236,7 +288,11 @@ class TensorTrain:
 
             cores.append(new_core)
 
-        return TensorTrain.from_cores(cores)        
+        return TensorTrain.from_cores(cores)
+
+    def __sub__(self, other):
+        """Subtract two tensor trains element-wise."""
+        return self + (-1) * other      
 
     def __rmul__(self, constant):
         """Multiply a tensor train by a constant.
@@ -280,7 +336,12 @@ class TensorTrain:
             right_matrix = other.cores[i]
 
             new_core = torch.einsum('aijb,cijd->acijbd', left_matrix, right_matrix)
-            new_core = new_core.reshape(left_matrix.size(0) * right_matrix.size(0), left_matrix.size(1), left_matrix.size(2), left_matrix.size(3) * left_matrix.size(3))
+            new_core = new_core.reshape(
+                left_matrix.size(0) * right_matrix.size(0),
+                left_matrix.size(1),
+                left_matrix.size(2),
+                left_matrix.size(3) * right_matrix.size(3)
+            )
 
             cores.append(new_core)
         return TensorTrain.from_cores(cores)
