@@ -144,7 +144,14 @@ class TensorTrain:
             tt.orthogonalize(mode, new_ranks, inplace=True)
             return tt
     
-    def round(self, new_ranks, inplace=False):
+    def round(self, new_ranks=None, inplace=False, like=None):
+        if type(new_ranks) == int:
+            new_ranks = [1] + [new_ranks] * (self.order - 1) + [1]
+        elif not new_ranks and not like:
+            new_ranks = [1] + [i*o for i, o in zip(self.in_shape, self.out_shape)] + [1]
+        elif like:
+            new_ranks = like.ranks
+
         if inplace:
             self.orthogonalize(mode="right", inplace=True)
 
@@ -187,19 +194,36 @@ class TensorTrain:
             struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
         struct.append(in_axis+out_axis)
         return contract(*struct)
+
+    def to_tensor(self):
+        return self.reconstruct()
     
-    def norm(self):
+    def size(self):
+        return [core.size() for core in self.cores]
+    
+    def norm(self, mode="full"):
         """Compute the norm of the tensor train by performing an einsum contraction
         on the TT and its conjugate."""
+        return self.inner(self, mode=mode)
+    
+    def inner(self, other, mode="right"):
+        """Compute the inner product between two tensor trains."""
         struct = []
-        for i, core in enumerate(self.cores):
-            struct.append(core)
-            struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
-            struct.append(core)
-            struct.append((f"rank2_{i}", f"in_{i}", f"out_{i}", f"rank2_{i+1}"))
+
+        if mode == "full":
+            for i, (core1, core2) in enumerate(zip(self.cores, other.cores)):
+                struct.append(core1)
+                struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
+                struct.append(core2)
+                struct.append((f"rank2_{i}", f"in_{i}", f"out_{i}", f"rank2_{i+1}"))
+        elif mode == "right":
+            struct.append(self.cores[-1])
+            struct.append((f"rank_{self.order-1}", f"in_{self.order-1}", f"out_{self.order-1}", f"rank_{self.order}"))
+            struct.append(other.cores[-1])
+            struct.append((f"rank_{self.order-1}", f"in_{self.order-1}", f"out_{self.order-1}", f"rank2_{self.order}"))
         return float(contract(*struct).squeeze())
 
-    def sqrtinv(self, threshold=1e-8):
+    def sqrtinv(self, threshold=1e-8, max_iter=4):
         """Compute the element-wise reciprocal of the square root of the tensor train
         using the Newton method to the equation (1/x^2 - y = 0)"""
 
@@ -212,20 +236,21 @@ class TensorTrain:
 
         # Scale the tensor train by 1/4^k
         A = c * self.clone()
+        max_ranks = [1] + [i*o for i, o in zip(self.in_shape, self.out_shape)] + [1]
 
-        max_iter = 10
         while max_iter > 0:
-            B = -1/2 * (self * (A * A)).add_(-3)
-            B = B.round(self.ranks)
+            B = -1/2 * (self * (A * A).round(max_ranks)).add_(-3)
+            B = B.round(max_ranks)
             C = A * B
-            C = C.round(self.ranks)
+            C = C.round(max_ranks)
 
             if threshold:
-                if abs((C - A).norm()) < threshold:
+                norm = abs((C - A).norm())
+                if norm < threshold:
                     return revc * C
             A = C
             max_iter -= 1
-            
+
         # Scale back the tensor train by 2^(k-1) to account for the initial scaling
         A = revc * A
         return A
@@ -239,7 +264,8 @@ class TensorTrain:
         # Find the maximum value of the tensor train
         # Then, compute the number of bits to shift the tensor train to the right
         # This allows the square root algorithm to converge
-        max_value = float(max([core.abs().max() for core in self.cores]))
+        # max_value = float(max([core.abs().max() for core in self.cores]))
+        max_value = float(self.cores[-1].abs().max())
         k = floor(log(max_value) / log(4))
 
         # Scale the tensor train by 1/4^k
