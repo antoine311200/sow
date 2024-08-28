@@ -9,6 +9,45 @@ profiler = cProfile.Profile()
 # Set seed
 torch.manual_seed(0)
 
+from opt_einsum import contract
+
+def generate_rank_k_tensor(shape, k, sumof=1):
+    tensor = torch.zeros(shape)
+    for j in range(sumof):
+        factors = [2 * torch.rand(dim, k) - 1 for dim in shape]
+        struct = []
+        for i, factor in enumerate(factors):
+            struct.append(factor)
+            struct.append([f"l_{i}", "k"])
+        tensor += contract(*struct)
+    return tensor
+
+
+def sgd_update(
+    gradient: TensorTrain,
+    momentum: float,
+    alpha: float,
+    dampening: float,
+    nesterov: bool,
+    buffer: TensorTrain = None,
+):
+    if momentum:
+        if buffer is None:
+            print("wtf")
+            buffer = gradient
+        else:
+            buffer = momentum * buffer + (1 - dampening) * gradient 
+        if nesterov:
+            gradient = gradient + momentum * buffer
+        else:
+            gradient = buffer
+
+    if isinstance(gradient, TensorTrain):
+        gradient = gradient.round()
+
+    return alpha * gradient
+
+
 def tt_adam_update(
     gradient: torch.tensor,
     m: TensorTrain,
@@ -18,21 +57,22 @@ def tt_adam_update(
     beta2: float,
     eps: float
 ):
-    # ranks = gradient.ranks.copy()
+
     m = beta1 * m + (1 - beta1) * gradient
     v = beta2 * v + (1 - beta2) * (gradient * gradient)#.round(ranks)
-    
+    v = v.round(gradient.in_shape[0] * gradient.out_shape[0])
+
     # Replace negative values in the cores of v by 0
     # v.cores = [torch.maximum(core, torch.zeros_like(core)) for core in v.cores]
 
-    m_hat = 1 / (1 - beta1) * m
-    v_hat = 1 / (1 - beta2) * v
-
+    m_hat = (1 / (1 - beta1)) * m
+    v_hat = (1 / (1 - beta2)) * v
 
     # m_hat = m_hat.reconstruct()
     # v_hat = v_hat.reconstruct()
 
-    return alpha * m_hat #/ (torch.sqrt(v_hat) + eps)
+    return alpha * m_hat * v_hat.sqrtinv(max_iter=50, threshold=1e-6)
+    # return alpha * m_hat / (v_hat.sqrt().add_(eps))
 
 def adam_update(
     gradient: torch.tensor,
@@ -52,19 +92,23 @@ def adam_update(
     return alpha * m_hat / (torch.sqrt(v_hat) + eps)
 
 
+################## Parameters ##################
 
-M, N = 8*8*8, 8*8*8
-rank = 6
+M, N = 2**8, 2**8#8*8*8, 8*8*8
 galore_rank = 64
+rank = 4
+
+order = 8
+ranks = [1] + [rank] * (order - 1) + [1]
+input_shape = closest_factorization(M, order)[0]
+output_shape = closest_factorization(N, order)[0]
 
 ################## Base tensor ##################
 
-# grad = torch.randn(M, N).abs().to("cuda")
-# grad = torch.ones(M, N).to("cuda")
-# Create a dummy rank 10 tensor of shape (M, N)
-grad = torch.arange(M * N).reshape(M, N).float().to("cuda")
-# Print the rank
-print("Rank of the tensor: ", torch.linalg.matrix_rank(grad))
+rank_grad = generate_rank_k_tensor(input_shape+output_shape, 2, sumof=2)
+# print("Rank of the tensor: ", torch.linalg.matrix_rank(rank_grad))
+grad = rank_grad.reshape(M, N).float().to("cuda")
+
 m = torch.zeros(M, N).to("cuda")
 v = torch.zeros(M, N).to("cuda")
 
@@ -72,11 +116,6 @@ n_params = grad.numel() + m.numel() + v.numel()
 print("Total number of parameters: ", n_params)
 
 ################## Tensor Train ##################
-
-order = 3
-ranks = [1] + [rank] * (order - 1) + [1]
-input_shape = closest_factorization(M, order)[0]
-output_shape = closest_factorization(N, order)[0]
 
 print("Input shape: ", input_shape)
 print("Output shape: ", output_shape)
@@ -90,6 +129,9 @@ tt_v = TensorTrain.zeros(ranks, input_shape, output_shape).to("cuda")
 n_tt_params = tt_grad.numel() + tt_m.numel() + tt_v.numel()
 print("Total number of parameters (TT): ", n_tt_params)
 print("Reduction factor: ", n_params / n_tt_params * 100, "%")
+
+# Print decomposition error from the TT decomposition
+print("TT decomposition error: ", torch.linalg.norm(tt_grad.reconstruct().reshape(M, N) - grad))
 
 ################## Galore ##################
 
@@ -106,21 +148,27 @@ beta1 = 0.9
 beta2 = 0.999
 eps = 1e-8
 
+momentum = 0.9
+dampening = 0.0
+nesterov = True
+
 # Compute the elapsed time for the TT update
 import time
 
 start = time.time()
 def loop_tt_update():
     for _ in range(50):
-        tt_update = tt_adam_update(tt_grad, tt_m, tt_v, alpha, beta1, beta2, eps)
-    
+        # tt_update = tt_adam_update(tt_grad, tt_m, tt_v, alpha, beta1, beta2, eps)
+        tt_update = sgd_update(tt_grad, momentum, alpha, dampening, nesterov, buffer=tt_m)
+
 profiler.runcall(loop_tt_update)
 end = time.time()
 print("Elapsed time (TT): ", end - start)
 
 start = time.time()
 for _ in range(50):
-    update = adam_update(grad, m, v, alpha, beta1, beta2, eps)
+    # update = adam_update(grad, m, v, alpha, beta1, beta2, eps)
+    update = sgd_update(grad, momentum, alpha, dampening, nesterov, buffer=m)
 end = time.time()
 print("Elapsed time (standard): ", end - start)
 
@@ -130,15 +178,11 @@ print("Elapsed time (standard): ", end - start)
 # print("Elapsed time (GaLore): ", end - start)
 
 tt_update = tt_adam_update(tt_grad, tt_m, tt_v, alpha, beta1, beta2, eps)
-tt_update = tt_update.reconstruct()
+if isinstance(tt_update, TensorTrain):
+    tt_update = tt_update.reconstruct()
 tt_update = tt_update.reshape(M, N)
 
-# Check if NaN in tt_update
-# print("NaN in TT update: ", torch.isnan(tt_update).any())
-# # Print the positions of NaN in tt_update
-# print("Positions of NaN in TT update: ", torch.where(torch.isnan(tt_update)))
-
-print("TT update: ", tt_update)
+# print("TT update: ", tt_update)
 # print("Galore update: ", galore_update)
 # print("Update: ", update)
 
@@ -146,34 +190,8 @@ print("L2 Norm (TT): ", torch.linalg.norm(tt_update - update))
 # print("L2 Norm (GaLore): ", torch.linalg.norm(galore_update - update))
 
 # Print norm L1 between the updates
-print("L1 Norm (TT):", torch.linalg.norm(tt_update - update, ord=1))
+# print("L1 Norm (TT):", torch.linalg.norm(tt_update - update, ord=1))
 # print("L1 Norm (GaLore):", torch.linalg.norm(galore_update - update, ord=1))
 
 # profiler.print_stats()
-profiler.print_stats(sort='tottime')
-
-# A = torch.arange(12).reshape(1, 12).float() / 12
-# B = torch.arange(12*8).reshape((12, 8)).float() / 12 / 8
-# C = torch.arange(8).reshape((1, 8)).float() / 8
-
-# # print sqrt(ABC)
-# D = torch.einsum("ij,jk,lk->il", A, B, C)
-# print(D)
-# print(torch.sqrt(D))
-
-# print(torch.sqrt(A) @ torch.sqrt(B) @ torch.sqrt(C).t())
-
-# A = torch.arange(2*2).reshape(2, 2).float()
-# Q, R = torch.linalg.qr(A, mode="complete")
-# Q2, R2 = torch.abs(Q), torch.abs(R)
-# print(Q, R)
-# print(Q2 @ R2)
-
-# tensor = torch.arange(2*2*2*3*3*3).reshape(2, 2, 2, 3, 3, 3).float()
-# tt = TensorTrain.from_tensor(tensor, [1, 3, 3, 1])
-
-# # Print the norm between the tensor and the tensor train
-# print("||A - A_tt|| = ", torch.linalg.norm(tensor - tt.reconstruct()).float())
-
-# tt_sqrt = tt.sqrt()
-# print("||sqrt(A) - sqrt(A_tt)|| = ", torch.linalg.norm(torch.sqrt(tensor) - tt_sqrt.reconstruct()).float())
+# profiler.print_stats(sort='tottime')
