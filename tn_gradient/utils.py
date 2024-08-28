@@ -1,6 +1,8 @@
 import torch
 from math import ceil
 
+from opt_einsum import contract
+
 def pad_matrix(matrix, new_shape):
     padded_matrix = torch.zeros(new_shape)
     padded_matrix[:matrix.shape[0], :matrix.shape[1]] = matrix
@@ -17,6 +19,19 @@ def closest_factorization(n, d):
             if p < o:
                 factors[-1] += n
             return factors, p
+        
+def generate_rank_k(shape, rank, mix=1, pos=False):
+    tensor = torch.zeros(shape)
+    for j in range(mix):
+        factors = [torch.rand(dim, rank) for dim in shape]
+        if not pos:
+            factors = [2 * factor - 1 for factor in factors]
+        struct = []
+        for i, factor in enumerate(factors):
+            struct.append(factor)
+            struct.append([f"l_{i}", "k"])
+        tensor += contract(*struct)
+    return tensor
 
 def unfolding(tensor, mode):
     """Unfolds a d-dimensional tensor (a_1, ..., a_d) into a matrix (a_i, a_{i+1} * ... * a_d * a_1 * ... * a_{i-1})"""
