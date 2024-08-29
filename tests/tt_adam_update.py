@@ -1,15 +1,18 @@
 import cProfile
 from pstats import Stats
+from math import ceil, log2
 
 import torch
+from opt_einsum import contract
+
 from tn_gradient.tt import TensorTrain
-from tn_gradient.utils import closest_factorization
+from tn_gradient.utils import closest_factorization, pad_matrix, unpad_matrix
 
 profiler = cProfile.Profile()
+
 # Set seed
 torch.manual_seed(0)
 
-from opt_einsum import contract
 
 def generate_rank_k_tensor(shape, k, sumof=1):
     tensor = torch.zeros(shape)
@@ -94,20 +97,33 @@ def adam_update(
 
 ################## Parameters ##################
 
-M, N = 2**8, 2**8#8*8*8, 8*8*8
+M, N = 3**4, 3**4#8*8*8, 8*8*8
 galore_rank = 64
 rank = 4
 
-order = 8
+order = 4
 ranks = [1] + [rank] * (order - 1) + [1]
 input_shape = closest_factorization(M, order)[0]
 output_shape = closest_factorization(N, order)[0]
 
 ################## Base tensor ##################
 
+# M_padded = 2 ** ceil(log2(M))
+# N_padded = 2 ** ceil(log2(N))
+# # print("NEXT", N1, N2)
+# print(M_padded, N_padded)
+
+mm = ceil(M ** (1 / order))
+nn = ceil(N ** (1 / order))
+M_padded = mm ** order
+N_padded = nn ** order
+
 rank_grad = generate_rank_k_tensor(input_shape+output_shape, 2, sumof=2)
 # print("Rank of the tensor: ", torch.linalg.matrix_rank(rank_grad))
 grad = rank_grad.reshape(M, N).float().to("cuda")
+print("Shape of the gradient: ", grad.shape)
+padded_grad = pad_matrix(grad, (M_padded, N_padded))
+print("New shape of the gradient: ", grad.shape)
 
 m = torch.zeros(M, N).to("cuda")
 v = torch.zeros(M, N).to("cuda")
@@ -120,18 +136,26 @@ print("Total number of parameters: ", n_params)
 print("Input shape: ", input_shape)
 print("Output shape: ", output_shape)
 
+padded_input_shape = (mm, ) * order
+padded_output_shape = (nn, ) * order
+print("Padded input shape: ", padded_input_shape)
+print("Padded output shape: ", padded_output_shape)
 tt_grad = TensorTrain.from_tensor(
-    grad.reshape(input_shape + output_shape),
+    # grad.reshape(input_shape + output_shape),
+    padded_grad.reshape(padded_input_shape + padded_output_shape),
     ranks=ranks
 ).to("cuda")
-tt_m = TensorTrain.zeros(ranks, input_shape, output_shape).to("cuda")
-tt_v = TensorTrain.zeros(ranks, input_shape, output_shape).to("cuda")
+tt_m = TensorTrain.zeros(ranks, padded_input_shape, padded_output_shape).to("cuda")
+tt_v = TensorTrain.zeros(ranks, padded_input_shape, padded_output_shape).to("cuda")
+# tt_m = TensorTrain.zeros(ranks, input_shape, output_shape).to("cuda")
+# tt_v = TensorTrain.zeros(ranks, input_shape, output_shape).to("cuda")
 n_tt_params = tt_grad.numel() + tt_m.numel() + tt_v.numel()
 print("Total number of parameters (TT): ", n_tt_params)
-print("Reduction factor: ", n_params / n_tt_params * 100, "%")
+print("Reduction factor: ", n_params / n_tt_params, "times")
 
 # Print decomposition error from the TT decomposition
-print("TT decomposition error: ", torch.linalg.norm(tt_grad.reconstruct().reshape(M, N) - grad))
+tt2t = unpad_matrix(tt_grad.reconstruct().reshape(M_padded, N_padded), (M, N))
+print("TT decomposition error: ", torch.linalg.norm(tt2t - grad))
 
 ################## Galore ##################
 
@@ -177,10 +201,13 @@ print("Elapsed time (standard): ", end - start)
 # end = time.time()
 # print("Elapsed time (GaLore): ", end - start)
 
-tt_update = tt_adam_update(tt_grad, tt_m, tt_v, alpha, beta1, beta2, eps)
-if isinstance(tt_update, TensorTrain):
-    tt_update = tt_update.reconstruct()
-tt_update = tt_update.reshape(M, N)
+# tt_update = tt_adam_update(tt_grad, tt_m, tt_v, alpha, beta1, beta2, eps)
+tt_update = sgd_update(tt_grad, momentum, alpha, dampening, nesterov, buffer=tt_m)
+# if isinstance(tt_update, TensorTrain):
+#     tt_update = tt_update.reconstruct()
+# tt_update = tt_update.reshape(M, N)
+tt_update = unpad_matrix(tt_update.reconstruct().reshape(M_padded, N_padded), (M, N))
+
 
 # print("TT update: ", tt_update)
 # print("Galore update: ", galore_update)
