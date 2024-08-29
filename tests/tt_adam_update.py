@@ -63,7 +63,7 @@ def tt_adam_update(
 
     m = beta1 * m + (1 - beta1) * gradient
     v = beta2 * v + (1 - beta2) * (gradient * gradient)#.round(ranks)
-    v = v.round(gradient.in_shape[0] * gradient.out_shape[0])
+    v = v.round(gradient.input_shape[0] * gradient.output_shape[0])
 
     # Replace negative values in the cores of v by 0
     # v.cores = [torch.maximum(core, torch.zeros_like(core)) for core in v.cores]
