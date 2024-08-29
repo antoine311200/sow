@@ -10,15 +10,15 @@ from tn_gradient.utils import closest_factorization, pad_matrix, unpad_matrix
 
 class TensorTrain:
 
-    def __init__(self, ranks, in_shape, out_shape, device=None) -> None:
+    def __init__(self, ranks, input_shape, output_shape, device=None) -> None:
         self.order = len(ranks) - 1
         self.ranks = ranks
-        self.in_shape = in_shape
-        self.out_shape = out_shape
+        self.input_shape = input_shape
+        self.output_shape = output_shape
         
         self.cores = [None for _ in range(self.order)]
         self.device = device
-        #torch.empty((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(self.order)]
+        #torch.empty((ranks[i], input_shape[i], output_shape[i], ranks[i+1])) for i in range(self.order)]
         # if device:
             # self.to(device)
         # else:
@@ -26,7 +26,7 @@ class TensorTrain:
 
     @staticmethod
     def from_tensor(tensor: torch.Tensor, ranks: list):
-        """Assuming tensor axis are of the form (*in_shape, *out_shape) 
+        """Assuming tensor axis are of the form (*input_shape, *output_shape) 
                 (e.g (2, 2, 2, 3, 3, 3) for a tensor_(2, 2, 2)^(3, 3, 3))
         """
         tt = TensorTrain(ranks, tensor.shape[:len(tensor.shape)//2], tensor.shape[len(tensor.shape)//2:])
@@ -68,16 +68,16 @@ class TensorTrain:
         return TensorTrain.from_tensor(tensor, ranks).to(matrix.device)
     
     @staticmethod
-    def zeros(ranks, in_shape, out_shape, device="cpu"):
-        tt = TensorTrain(ranks, in_shape, out_shape)
-        tt.cores = [torch.zeros((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+    def zeros(ranks, input_shape, output_shape, device="cpu"):
+        tt = TensorTrain(ranks, input_shape, output_shape)
+        tt.cores = [torch.zeros((ranks[i], input_shape[i], output_shape[i], ranks[i+1])) for i in range(tt.order)]
         tt.to(device)
         return tt
     
     @staticmethod
-    def ones(ranks, in_shape, out_shape, device="cpu"):
-        tt = TensorTrain(ranks, in_shape, out_shape)
-        tt.cores = [torch.ones((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
+    def ones(ranks, input_shape, output_shape, device="cpu"):
+        tt = TensorTrain(ranks, input_shape, output_shape)
+        tt.cores = [torch.ones((ranks[i], input_shape[i], output_shape[i], ranks[i+1])) for i in range(tt.order)]
         tt.to(device)
         return tt
 
@@ -94,12 +94,12 @@ class TensorTrain:
         return self
     
     def clone(self):
-        tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
+        tt = TensorTrain(self.ranks.copy(), self.input_shape, self.output_shape)
         tt.cores = self.cores.copy()
         return tt
 
     def detach(self):
-        tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
+        tt = TensorTrain(self.ranks.copy(), self.input_shape, self.output_shape)
         tt.cores = [core.detach() for core in self.cores]
         return tt
 
@@ -120,17 +120,17 @@ class TensorTrain:
             TensorTrain: The tensor train resulting from the decomposition
         """
         for k in range(self.order - 1):
-            L = tensor.reshape(self.ranks[k] * self.in_shape[k] * self.out_shape[k], -1)
+            L = tensor.reshape(self.ranks[k] * self.input_shape[k] * self.output_shape[k], -1)
             Q, R = torch.linalg.qr(L, mode="complete")
             
             right_rank = self.ranks[k+1]
             Q = Q[:, :right_rank]
             R = R[:right_rank, :]
             
-            self.cores[k] = torch.reshape(Q, (self.ranks[k], self.in_shape[k], self.out_shape[k], right_rank))
+            self.cores[k] = torch.reshape(Q, (self.ranks[k], self.input_shape[k], self.output_shape[k], right_rank))
             tensor = R
 
-        self.cores[-1] = torch.reshape(tensor, (self.ranks[-2], self.in_shape[-1], self.out_shape[-1], self.ranks[-1]))
+        self.cores[-1] = torch.reshape(tensor, (self.ranks[-2], self.input_shape[-1], self.output_shape[-1], self.ranks[-1]))
     
     def orthogonalize(self, mode="left", new_ranks=None, inplace=False):
         if inplace:
@@ -176,7 +176,7 @@ class TensorTrain:
         if type(new_ranks) == int:
             new_ranks = [1] + [new_ranks] * (self.order - 1) + [1]
         elif not new_ranks and not like:
-            new_ranks = [1] + [i*o for i, o in zip(self.in_shape, self.out_shape)] + [1]
+            new_ranks = [1] + [i*o for i, o in zip(self.input_shape, self.output_shape)] + [1]
         elif like:
             new_ranks = like.ranks
 
@@ -228,13 +228,15 @@ class TensorTrain:
 
     def to_matrix(self, shape):
         matrix = self.to_tensor().reshape(
-            torch.prod(torch.tensor(self.in_shape)),
-            torch.prod(torch.tensor(self.out_shape))
+            torch.prod(torch.tensor(self.input_shape)),
+            torch.prod(torch.tensor(self.output_shape))
         )
         return unpad_matrix(matrix, shape)
-        
-
-
+    
+    def requires_grad_(self, bool):
+        for core in self.cores:
+            core.requires_grad_(bool)
+        return self
     
     def size(self):
         return [core.size() for core in self.cores]
@@ -274,7 +276,7 @@ class TensorTrain:
 
         # Scale the tensor train by 1/4^k
         A = c * self.clone()
-        max_ranks = [1] + [i*o for i, o in zip(self.in_shape, self.out_shape)] + [1]
+        max_ranks = [1] + [i*o for i, o in zip(self.input_shape, self.output_shape)] + [1]
 
         while max_iter > 0:
             B = -1/2 * (self * (A * A).round(max_ranks)).add_(-3)
@@ -361,7 +363,7 @@ class TensorTrain:
 
             cores.append(new_core)
         return TensorTrain.from_cores(cores)
-        # return self + subconstant * TensorTrain.ones(self.ranks, self.in_shape, self.out_shape, device=self.device)
+        # return self + subconstant * TensorTrain.ones(self.ranks, self.input_shape, self.output_shape, device=self.device)
 
     def __add__(self, other):
         """Add two tensor trains element-wise.
@@ -466,8 +468,8 @@ class TensorTrain:
         cores = []
         for i in range(self.order):
             new_core = torch.zeros_like(self.cores[i])
-            for inp in range(self.in_shape[i]):
-                for out in range(self.out_shape[i]):
+            for inp in range(self.input_shape[i]):
+                for out in range(self.output_shape[i]):
                     if i == 0:
                         new_core[:, inp, out, :] = self.cores[i][:, inp, out, :]
                     elif i == self.order - 1:
@@ -479,12 +481,12 @@ class TensorTrain:
        
     def left_matrix(self, index):
         """Left matrizification of the core at index. C(rk-1, ik, jk, rk) -> C(rk-1 * ik * jk, rk)"""
-        return self.cores[index].reshape((self.ranks[index] * self.in_shape[index] * self.out_shape[index], -1))
+        return self.cores[index].reshape((self.ranks[index] * self.input_shape[index] * self.output_shape[index], -1))
     
     def right_matrix(self, index):
         """Right matrizification of the core at index. C(rk, ik, jk, rk+1) -> C(rk, ik * jk * rk+1)"""
-        return self.cores[index].reshape((-1, self.in_shape[index] * self.out_shape[index] * self.ranks[index+1]))
+        return self.cores[index].reshape((-1, self.input_shape[index] * self.output_shape[index] * self.ranks[index+1]))
     
     def to_core(self, matrix, index):
         """Reshape a matrix to the core shape at index C(rk, ik, jk, rk+1)"""
-        return matrix.reshape((self.ranks[index], self.in_shape[index], self.out_shape[index], self.ranks[index+1]))
+        return matrix.reshape((self.ranks[index], self.input_shape[index], self.output_shape[index], self.ranks[index+1]))
