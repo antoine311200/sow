@@ -1,12 +1,20 @@
 import torch
+import torch.nn.functional as F
 from math import ceil
 
 from opt_einsum import contract
 
+
 def pad_matrix(matrix, new_shape):
-    padded_matrix = torch.zeros(new_shape)
+    # pad_shape = [0, new_shape[1] - matrix.shape[1], 0, new_shape[0] - matrix.shape[0]]
+    # padded_matrix = F.pad(matrix, pad_shape)
+    # return padded_matrix
+    padded_matrix = torch.zeros(new_shape, device=matrix.device)
     padded_matrix[:matrix.shape[0], :matrix.shape[1]] = matrix
     return padded_matrix
+
+def unpad_matrix(matrix, shape):
+    return matrix[:shape[0], :shape[1]]
 
 def closest_factorization(n, d):
     factors = []
