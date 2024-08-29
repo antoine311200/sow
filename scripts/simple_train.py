@@ -25,6 +25,10 @@ from tqdm import tqdm
 from loguru import logger
 
 from tn_gradient.optimizer.ttsgd import TTSGD
+from tn_gradient.optimizer.ttadam import TTAdam
+from tn_gradient.tt import TensorTrain
+
+from galore_torch import GaLoreAdamW
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -88,7 +92,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     )
     val_data_mapped.batch = lambda batch_size: batch_fn(val_data_mapped, batch_size)
 
-    target_eval_tokens = 10_000_000
+    target_eval_tokens = 1_000_000
     evaluated_on_tokens = 0
     total_loss = torch.tensor(0.0).to(device)
     total_batches = 1
@@ -218,9 +222,9 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
     
 
-    if "TT".lower() in args.optimizer:
+    if "TT".lower() in args.optimizer.lower() or "galore" in args.optimizer.lower():
         tt_params = []
-        target_modules_list = ["attn", "mlp", "dense", "attention"]
+        target_modules_list = ["attn", "mlp", "dense", "attention", "self_attn"]
         for module_name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
@@ -232,15 +236,27 @@ def main(args):
             tt_params.append(module.weight)
         id_tt_params = [id(p) for p in tt_params]
         regular_params = [p for p in trainable_params if id(p) not in id_tt_params]
-        param_groups = [
-            {"params": regular_params},
-            {"params": tt_params, "ranks": [1] + [int(args.rank)] * (int(args.order) - 1) + [1]},
-        ]
+        
+        if "tt" in args.optimizer.lower():
+            param_groups = [
+                {"params": regular_params},
+                {"params": tt_params, "ranks": [1] + [int(args.rank)] * (int(args.order) - 1) + [1]},
+            ]
+        else:
+            param_groups = [
+                {"params": regular_params},
+                {"params": tt_params,
+                 'rank': 128,
+                 'update_proj_gap': 200,
+                 'scale': 0.25,
+                 'proj_type': "std"
+                }
+            ]
 
     logger.info(f"\n{model}\n")
     logger.info(f"Total params: {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
-    if "tt" in args.optimizer.lower():
+    if "tt" in args.optimizer.lower() or "galore" in args.optimizer.lower():
         logger.info(f"Total params with Tensor Train enabled: {sum(p.numel() for p in tt_params) / 1_000_000:.2f}M")
 
     if args.optimizer.lower() == "TTSGD".lower():
@@ -259,6 +275,17 @@ def main(args):
             weight_decay=args.weight_decay,
             nesterov=args.nesterov,
         )
+    elif args.optimizer.lower() == "TTAdam".lower():
+        optimizer = TTAdam(
+            param_groups,
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=args.weight_decay,
+            amsgrad=False,
+        )
+    elif args.optimizer.lower() == "galore_adamw":
+        optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "AdamW".lower():
         optimizer = torch.optim.AdamW(
             trainable_params,
@@ -322,11 +349,18 @@ def main(args):
         if global_rank == 0: pbar.update(1)
         if update_step == 50:
             # Get the optimizer memory usage
-            optimizer_memory_usage = calculate_optimizer_memory_usage(optimizer)
-            optimizer_memory_usage = optimizer_memory_usage / (1024 * 1024)
-            logger.info(f"\nOptimizer memory usage: {optimizer_memory_usage:.2f} MiB")
+            optimizer_memory_usage, optimizer_tt_memory_usage = calculate_optimizer_memory_usage(optimizer)
+            full_optimizer_memory_usage = optimizer_memory_usage + optimizer_tt_memory_usage
+            full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
+            
+            # print new line 
+            print("\n")
+            logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
+            logger.info(f"  -> tensor-train : {optimizer_tt_memory_usage / (1024 * 1024):.2f} MiB")
+            logger.info(f"  -> standard : {optimizer_memory_usage / (1024 * 1024):.2f} MiB")
 
         optimizer.step()
+        # torch.autograd.set_detect_anomaly(True)
         scheduler.step()
         optimizer.zero_grad()
 
@@ -722,11 +756,15 @@ def max_train_tokens_to_number(max_train_tokens):
 
 def calculate_optimizer_memory_usage(optimizer):
     memory_usage = 0
+    tt_memory_usage = 0
     for state in optimizer.state.values():
         for tensor in state.values():
             if isinstance(tensor, torch.Tensor):
                 memory_usage += tensor.nelement() * tensor.element_size()
-    return memory_usage
+            elif isinstance(tensor, TensorTrain):
+                for core in tensor.cores:
+                    tt_memory_usage += core.nelement() * core.element_size()
+    return memory_usage, tt_memory_usage
 
 
 if __name__ == "__main__":
