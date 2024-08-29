@@ -1,10 +1,12 @@
 import torch
 import torch.nn.functional as F
 
-from math import floor, log, sqrt
+from math import floor, log, sqrt, ceil
 
 from opt_einsum import contract
 from scipy import linalg
+
+from tn_gradient.utils import closest_factorization, pad_matrix, unpad_matrix
 
 class TensorTrain:
 
@@ -45,6 +47,27 @@ class TensorTrain:
         return tt
     
     @staticmethod
+    def from_matrix(matrix: torch.Tensor, ranks: list, padding=True):
+        order = len(ranks) - 1
+
+        M, N = matrix.shape
+        mm = ceil(M ** (1 / order))
+        nn = ceil(N ** (1 / order))
+        M_padded = mm ** order
+        N_padded = nn ** order
+
+        matrix = pad_matrix(matrix, (M_padded, N_padded)) if padding else matrix
+
+        padded_input_shape = (mm, ) * order
+        padded_output_shape = (nn, ) * order
+
+        # print(matrix.shape, '->', padded_input_shape + padded_output_shape)
+
+        tensor = matrix.reshape(padded_input_shape + padded_output_shape)
+
+        return TensorTrain.from_tensor(tensor, ranks).to(matrix.device)
+    
+    @staticmethod
     def zeros(ranks, in_shape, out_shape, device="cpu"):
         tt = TensorTrain(ranks, in_shape, out_shape)
         tt.cores = [torch.zeros((ranks[i], in_shape[i], out_shape[i], ranks[i+1])) for i in range(tt.order)]
@@ -73,6 +96,11 @@ class TensorTrain:
     def clone(self):
         tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
         tt.cores = self.cores.copy()
+        return tt
+
+    def detach(self):
+        tt = TensorTrain(self.ranks.copy(), self.in_shape, self.out_shape)
+        tt.cores = [core.detach() for core in self.cores]
         return tt
 
     def decompose(self, tensor: torch.Tensor):
@@ -197,6 +225,16 @@ class TensorTrain:
 
     def to_tensor(self):
         return self.reconstruct()
+
+    def to_matrix(self, shape):
+        matrix = self.to_tensor().reshape(
+            torch.prod(torch.tensor(self.in_shape)),
+            torch.prod(torch.tensor(self.out_shape))
+        )
+        return unpad_matrix(matrix, shape)
+        
+
+
     
     def size(self):
         return [core.size() for core in self.cores]
