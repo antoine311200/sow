@@ -131,7 +131,9 @@ class TensorTrain:
             tensor = R
 
         self.cores[-1] = torch.reshape(tensor, (self.ranks[-2], self.input_shape[-1], self.output_shape[-1], self.ranks[-1]))
-    
+        
+        return self
+
     def orthogonalize(self, mode="left", new_ranks=None, inplace=False):
         if inplace:
             if mode == "left":

@@ -54,3 +54,4 @@ python-env-tools/**
 notebooks/
 wandb
 checkpoints
+*.pickle

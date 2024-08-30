@@ -6,7 +6,7 @@ import random
 import argparse
 import numpy as np
 from functools import partial
-
+import atexit
 
 import torch
 import torch.nn as nn
@@ -56,6 +56,7 @@ def parse_args(args):
     parser.add_argument("--grad_clipping", type=float, default=0.0)
     parser.add_argument("--num_training_steps", type=int, default=1_000_000)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
+    parser.add_argument("--monitor_memory", type=bool, default=False)
 
     # Tensor Train parameters
     parser.add_argument("--order", type=str, default="6")
@@ -259,6 +260,8 @@ def main(args):
     if "tt" in args.optimizer.lower() or "galore" in args.optimizer.lower():
         logger.info(f"Total params with Tensor Train enabled: {sum(p.numel() for p in tt_params) / 1_000_000:.2f}M")
 
+    logger.info(f"Model memory usage: {calculate_model_memory_usage(model) / (1024 * 1024):.2f} MiB")
+
     if args.optimizer.lower() == "TTSGD".lower():
         optimizer = TTSGD(
             param_groups,
@@ -322,6 +325,9 @@ def main(args):
 
     ############## Training loop ##############
 
+    if args.monitor_memory:
+        torch.cuda.memory._record_memory_history(max_entries=100_000)
+
     for batch_idx, batch in enumerate(dataloader):
 
         global_step += 1
@@ -348,6 +354,7 @@ def main(args):
 
         if global_rank == 0: pbar.update(1)
         if update_step == 50:
+            
             # Get the optimizer memory usage
             optimizer_memory_usage, optimizer_tt_memory_usage = calculate_optimizer_memory_usage(optimizer)
             full_optimizer_memory_usage = optimizer_memory_usage + optimizer_tt_memory_usage
@@ -358,6 +365,7 @@ def main(args):
             logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
             logger.info(f"  -> tensor-train : {optimizer_tt_memory_usage / (1024 * 1024):.2f} MiB")
             logger.info(f"  -> standard : {optimizer_memory_usage / (1024 * 1024):.2f} MiB")
+
 
         optimizer.step()
         # torch.autograd.set_detect_anomaly(True)
@@ -441,6 +449,17 @@ def main(args):
             )
         update_time = time.time()
 
+def cleanup():
+    if args.monitor_memory:
+        try:
+            torch.cuda.memory._dump_snapshot(f"memory.pickle")
+        except Exception as e:
+            logger.error(f"Failed to capture memory snapshot {e}")
+
+        # Stop recording memory snapshot history.
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+atexit.register(cleanup)
 
 import os
 import math
@@ -766,6 +785,19 @@ def calculate_optimizer_memory_usage(optimizer):
                     tt_memory_usage += core.nelement() * core.element_size()
     return memory_usage, tt_memory_usage
 
+def calculate_model_memory_usage(model):
+    memory_usage = 0
+    for param in model.parameters():
+        if isinstance(param, torch.Tensor):
+            memory_usage += param.nelement() * param.element_size()
+    return memory_usage
+
+def calculate_batch_memory_usage(batch, labels):
+    memory_usage = 0
+    for tensor in batch.values():
+        memory_usage += tensor.nelement() * tensor.element_size()
+    memory_usage += labels.nelement() * labels.element_size()
+    return memory_usage
 
 if __name__ == "__main__":
     print("Starting script")
