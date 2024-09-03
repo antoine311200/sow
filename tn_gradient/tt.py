@@ -1,9 +1,11 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 from math import floor, log, sqrt, ceil
 
-from opt_einsum import contract
+from opt_einsum import contract, contract_path, contract_expression
+from opt_einsum.contract import ContractExpression
 from scipy import linalg
 
 from tn_gradient.utils import closest_factorization, pad_matrix, unpad_matrix
@@ -18,11 +20,8 @@ class TensorTrain:
         
         self.cores = [None for _ in range(self.order)]
         self.device = device
-        #torch.empty((ranks[i], input_shape[i], output_shape[i], ranks[i+1])) for i in range(self.order)]
-        # if device:
-            # self.to(device)
-        # else:
-        #     self.device = self.cores[0].device
+        
+        self.contract_expr: ContractExpression = None
 
     @staticmethod
     def from_tensor(tensor: torch.Tensor, ranks: list):
@@ -102,6 +101,11 @@ class TensorTrain:
         tt = TensorTrain(self.ranks.copy(), self.input_shape, self.output_shape)
         tt.cores = [core.detach() for core in self.cores]
         return tt
+    
+    def type(self, dtype):
+        for core in self.cores:
+            core.type(dtype)
+        return self
 
     def decompose(self, tensor: torch.Tensor):
         """Decompose a tensor into a tensor train.
@@ -216,6 +220,9 @@ class TensorTrain:
         Returns:
             torch.Tensor: The reconstructed tensor
         """
+        if self.contract_expr:
+            return self.contract_expr(*[core for core in self.cores])
+
         struct = []
         in_axis = [f"in_{i}" for i in range(self.order)]
         out_axis = [f"out_{i}" for i in range(self.order)]
@@ -223,12 +230,15 @@ class TensorTrain:
             struct.append(core)
             struct.append((f"rank_{i}", f"in_{i}", f"out_{i}", f"rank_{i+1}"))
         struct.append(in_axis+out_axis)
-        return contract(*struct)
 
-    def to_tensor(self):
+        self.contract_expr = contract_expression(contract_path(*struct)[1].eq, *[core.shape for core in self.cores])
+
+        return self.contract_expr(*[core for core in self.cores])
+
+    def to_tensor(self) -> torch.Tensor:
         return self.reconstruct()
 
-    def to_matrix(self, shape):
+    def to_matrix(self, shape) -> torch.Tensor:
         matrix = self.to_tensor().reshape(
             torch.prod(torch.tensor(self.input_shape)),
             torch.prod(torch.tensor(self.output_shape))
@@ -492,3 +502,11 @@ class TensorTrain:
     def to_core(self, matrix, index):
         """Reshape a matrix to the core shape at index C(rk, ik, jk, rk+1)"""
         return matrix.reshape((self.ranks[index], self.input_shape[index], self.output_shape[index], self.ranks[index+1]))
+    
+    def to_params(self):
+        """Transform the cores of the tensor train into Pytorch parameters."""
+        cores = nn.ParameterList()
+        for core in self.cores:
+            cores.append(nn.Parameter(core))
+        self.cores = cores
+        return self

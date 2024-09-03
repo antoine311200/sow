@@ -27,7 +27,7 @@ def closest_factorization(n, d):
             if p < o:
                 factors[-1] += n
             return factors, p
-        
+
 def generate_rank_k(shape, rank, mix=1, pos=False):
     tensor = torch.zeros(shape)
     for j in range(mix):
