@@ -103,8 +103,9 @@ class TensorTrain:
         return tt
     
     def type(self, dtype):
-        for core in self.cores:
-            core.type(dtype)
+        self.cores = [core.type(dtype) for core in self.cores]
+        # for core in self.cores:
+        #     core = core.type(dtype)
         return self
 
     def decompose(self, tensor: torch.Tensor):
