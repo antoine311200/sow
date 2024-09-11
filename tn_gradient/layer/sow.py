@@ -6,9 +6,18 @@ from opt_einsum import contract_expression, contract_path
 from math import sqrt
 from typing import Tuple, List
 
+from dataclasses import dataclass
 
+@dataclass
+class SoWArgs:
+    device: str = None
+    dtype: torch.dtype = None
 
-class SumParameter(nn.ParameterList):
+    rank: int = 16
+    n_iter: int = 5
+    accumulation_steps: int = 200
+
+class SoWParameter(nn.ParameterList):
 
     def __init__(
         self,
@@ -19,7 +28,7 @@ class SumParameter(nn.ParameterList):
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(SumParameter, self).__init__(
+        super(SoWParameter, self).__init__(
             [
                 nn.Parameter(torch.empty(in_features, out_features, **factory_kwargs))
                 for _ in range(n_iter)
@@ -31,14 +40,13 @@ class SumParameter(nn.ParameterList):
 
     def from_weights(self, weights: List[torch.Tensor]) -> None:
         for i, weight in enumerate(weights):
-            print(i, weight.shape, self[i].shape)
             self[i].data = weight.data
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.in_features}, {self.out_features}, n_iter={self.n_iter})"
 
 
-class SumLinear(nn.Module):
+class SoWLinear(nn.Module):
 
     def __init__(
         self,
@@ -52,7 +60,7 @@ class SumLinear(nn.Module):
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(SumLinear, self).__init__()
+        super(SoWLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.n_iter = n_iter
@@ -63,10 +71,10 @@ class SumLinear(nn.Module):
         self.accumulate_every = accumulation_steps * 2 # To account for the forward in the backward pass
         self.accumulated_weight = None
 
-        self.downscale_weights = SumParameter(
+        self.downscale_weights = SoWParameter(
             in_features, rank, n_iter=n_iter, device=device, dtype=dtype
         )
-        self.upscale_weights = SumParameter(
+        self.upscale_weights = SoWParameter(
             rank, out_features, n_iter=n_iter, device=device, dtype=dtype
         )
 
@@ -128,13 +136,13 @@ class SumLinear(nn.Module):
         self.accumulated_weight = self.accumulated_weight.detach().to(self.downscale_weights[0].device)
 
         # Reset weights
-        for _, (downscale_weight, upscale_weight) in enumerate(
-            zip(self.downscale_weights, self.upscale_weights)
-        ):
-            downscale_weight = torch.zeros_like(downscale_weight)
-            # nn.init.kaiming_uniform_(downscale_weight, a=sqrt(5))
-            nn.init.kaiming_uniform_(upscale_weight, a=sqrt(5))
+        new_downscale_weights = [torch.zeros_like(x) for x in self.downscale_weights]
+        new_upscale_weights = [torch.zeros_like(x) for x in self.upscale_weights]
+        for i in range(len(self.upscale_weights)):
+            nn.init.kaiming_uniform_(new_upscale_weights[i], a=sqrt(5))
 
+        self.downscale_weights.from_weights(new_downscale_weights)
+        self.upscale_weights.from_weights(new_upscale_weights)
 
     def mingle(self):
         scale = 1 / self.n_iter
