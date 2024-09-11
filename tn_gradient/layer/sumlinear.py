@@ -29,6 +29,11 @@ class SumParameter(nn.ParameterList):
         self.out_features = out_features
         self.n_iter = n_iter
 
+    def from_weights(self, weights: List[torch.Tensor]) -> None:
+        for i, weight in enumerate(weights):
+            print(i, weight.shape, self[i].shape)
+            self[i].data = weight.data
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.in_features}, {self.out_features}, n_iter={self.n_iter})"
 
@@ -42,6 +47,7 @@ class SumLinear(nn.Module):
         bias: bool = True,
         rank: int = 16,
         n_iter: int = 5,
+        accumulation_steps: int = 200,
         device=None,
         dtype=None,
     ) -> None:
@@ -53,6 +59,9 @@ class SumLinear(nn.Module):
         self.rank = rank
         self.step = 0
         self.mingle_every = 200
+
+        self.accumulate_every = accumulation_steps * 2 # To account for the forward in the backward pass
+        self.accumulated_weight = None
 
         self.downscale_weights = SumParameter(
             in_features, rank, n_iter=n_iter, device=device, dtype=dtype
@@ -86,27 +95,46 @@ class SumLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.step % self.mingle_every == 0:
-            # print("Mingling")
-            # self.mingle()
-            pass
-            # self.reset_parameters(reset_scale=0.1)
+        # Get if training
+        if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
+            self.accumulate()
 
-        out = None
+        if self.accumulated_weight is not None:
+            out = x @ self.accumulated_weight
+        else:
+            out = None
+
         for downscale_weight, upscale_weight in zip(
             self.downscale_weights, self.upscale_weights
         ):
-            downproj = torch.einsum("bti,ir->btr", x, downscale_weight)
             if out is not None:
-                out += torch.einsum("btr,ro->bto", downproj, upscale_weight)
+                out += x @ (downscale_weight @ upscale_weight)
             else:
-                out = torch.einsum("btr,ro->bto", downproj, upscale_weight)
+                out = x @ (downscale_weight @ upscale_weight)
 
         if self.bias is not None:
             out += self.bias
 
         self.step += 1
         return out
+    
+    def accumulate(self):
+        accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()#.cpu().numpy()
+        if self.accumulated_weight is None:
+            self.accumulated_weight = accumalation
+        else:
+            self.accumulated_weight += accumalation
+
+        self.accumulated_weight = self.accumulated_weight.detach().to(self.downscale_weights[0].device)
+
+        # Reset weights
+        for _, (downscale_weight, upscale_weight) in enumerate(
+            zip(self.downscale_weights, self.upscale_weights)
+        ):
+            downscale_weight = torch.zeros_like(downscale_weight)
+            # nn.init.kaiming_uniform_(downscale_weight, a=sqrt(5))
+            nn.init.kaiming_uniform_(upscale_weight, a=sqrt(5))
+
 
     def mingle(self):
         scale = 1 / self.n_iter
