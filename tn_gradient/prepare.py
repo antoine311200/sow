@@ -24,13 +24,13 @@ def prepare_sow(
     5. The minor part of Q and R are used to form the downscale and upscale weight matrices of the new layer by splitting them into rank-sized chunks.
 
     Args:
-        model (_type_): _description_
-        target_modules (_type_): _description_
-        decompose (bool, optional): _description_. Defaults to True.
-        args (SoWArgs, optional): _description_. Defaults to SoWArgs().
+        model (nn.Module): The model to prepare.
+        target_modules (list[str]): The list of target modules to replace.
+        decompose (bool, optional): Whether to decompose the weights of the target modules. Defaults to True.
+        args (SoWArgs, optional): The arguments for the Sum-of-Weights decomposition. Defaults to SoWArgs().
 
     Returns:
-        _type_: _description_
+        nn.Module: The prepared model.
     """
     layers_to_replace = {}
     for name, module in model.named_modules():
@@ -38,6 +38,8 @@ def prepare_sow(
             layers_to_replace[name] = module
 
     for name, module in layers_to_replace.items():
+        # Convertion to float is necessary for the QR decomposition
+        # as CUDA does not support QR decomposition for half precision
         convertion = False
         if module.weight.data.dtype != torch.float:
             convertion = True
@@ -46,6 +48,7 @@ def prepare_sow(
             weight_device = module.weight.data.device
             module.weight = module.weight.to(torch.float)
 
+        # Create a blank Sum-of-Weights layer
         new_layer = SoWLinear(
             in_features=module.in_features,
             out_features=module.out_features,
