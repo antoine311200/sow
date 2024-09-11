@@ -4,15 +4,19 @@ import time
 import json
 import random
 import argparse
+from typing import OrderedDict
 import numpy as np
 from functools import partial
 import atexit
+import cProfile
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
 from torch.optim.lr_scheduler import LambdaLR
+from torch.autograd.profiler import record_function
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -25,10 +29,25 @@ from tqdm import tqdm
 from loguru import logger
 
 from tn_gradient.optimizer.ttsgd import TTSGD
-from tn_gradient.optimizer.ttadam import TTAdam
+from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
+from tn_gradient.layer.tensor_linear import TensorTrainLinear
+from tn_gradient.layer.sumlinear import SumLinear, SumTTLinear
 
 from galore_torch import GaLoreAdamW
+
+from contextlib import contextmanager
+
+@contextmanager
+def conditional_with(condition: bool, arg):
+    if condition:
+        if arg:
+            with arg as x:
+                yield x
+        else:
+            yield
+    else:
+        yield
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -59,13 +78,23 @@ def parse_args(args):
     parser.add_argument("--monitor_memory", type=bool, default=False)
 
     # Tensor Train parameters
-    parser.add_argument("--order", type=str, default="6")
-    parser.add_argument("--rank", type=str, default="4")
+    parser.add_argument("--architecture", type=str, default="linear")
+    parser.add_argument("--sow_acc_steps", type=int, default=200)
+    parser.add_argument("--order", type=int, default="6") # Only for TT layers
+    parser.add_argument("--rank", type=int, default="4")
+    parser.add_argument("--inner_rank", type=int, default="6") # Only for TT layers
+    parser.add_argument("--n_iter", type=int, default="4")
+
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
 
     args = parser.parse_args(args)
     # args = check_args_torchrun_main(args)
+
+    if args.total_batch_size is None:
+        args.gradient_accumulation = args.gradient_accumulation or 1
+        args.total_batch_size = args.batch_size * args.gradient_accumulation
+
     if args.save_dir is None:
         args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
 
@@ -153,9 +182,19 @@ def main(args):
 
     if args.gradient_accumulation is None:
         args.gradient_accumulation = args.total_batch_size // (args.batch_size * world_size)
+    if args.gradient_accumulation == 0:
+        args.gradient_accumulation = 1
+    logger.info(f"Gradient accumulation: {args.gradient_accumulation}")
+
+    if args.architecture == "sow":
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}"
+    elif args.architecture == "sttlinear":
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}-o-{args.order}-i-{args.inner_rank}"
+    else:
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}"
 
     if global_rank != 0: logger.remove()
-    if global_rank == 0: wandb.init(project="tn-gradient-roberta")
+    if global_rank == 0: wandb.init(project="tn-gradient-roberta", name=run_name)
     
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -192,6 +231,8 @@ def main(args):
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     model = AutoModelForCausalLM.from_config(model_config)
+
+    model = modify_model(model, args, device)
 
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
@@ -287,6 +328,15 @@ def main(args):
             weight_decay=args.weight_decay,
             amsgrad=False,
         )
+    elif args.optimizer.lower() == "TTRAdam".lower():
+        optimizer = TTRAdam(
+            param_groups,
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=args.weight_decay,
+            amsgrad=False,
+        )
     elif args.optimizer.lower() == "galore_adamw":
         optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     elif args.optimizer.lower() == "AdamW".lower():
@@ -325,141 +375,211 @@ def main(args):
 
     ############## Training loop ##############
 
+    profiler = None
     if args.monitor_memory:
         torch.cuda.memory._record_memory_history(max_entries=100_000)
 
-    for batch_idx, batch in enumerate(dataloader):
+        # profiler = torch.profiler.profile(
+        #     activities=[
+        #         torch.profiler.ProfilerActivity.CPU,
+        #         torch.profiler.ProfilerActivity.CUDA,
+        #     ],
+        #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
+        #     record_shapes=True,
+        #     profile_memory=True,
+        #     with_stack=True,
+        # )
+        logger.info("Starting memory profiling")
 
-        global_step += 1
-        local_step += 1
-        
-        if update_step > args.num_training_steps:
-            logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
-            print(f"Rank {global_rank} stopping training.")
-            break
-        
-        batch = {k: v.to(device) for k, v in batch.items()}
-        labels = batch["input_ids"].clone()
-        labels[labels == pad_idx] = -100
-        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+    atexit.register(cleanup, profiler, run_name)
 
-        loss = model(**batch, labels=labels).loss
-        scaled_loss = loss / args.gradient_accumulation
-        scaled_loss.backward()
+    # def trace_handler(prof: torch.profiler.profile):
+    #     import socket
+    #     TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
 
-        if global_step % args.gradient_accumulation != 0:
-            continue
+    #     host_name = socket.gethostname()
+    #     timestamp = datetime.now().strftime(TIME_FORMAT_STR)
+    #     file_prefix = f"{host_name}_{timestamp}"
+    #     # Construct the trace file.
+    #     prof.export_chrome_trace(f"{file_prefix}.json")
 
-        if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
+    #     # Construct the memory timeline file.
+    #     print("Device", device)
+    #     prof.export_memory_timeline(f"{file_prefix}.html", device=device)
+    
 
-        if global_rank == 0: pbar.update(1)
-        if update_step == 50:
+    with conditional_with(args.monitor_memory, profiler):
+    # with torch.profiler.profile(
+    #     activities=[
+    #         torch.profiler.ProfilerActivity.CPU,
+    #         torch.profiler.ProfilerActivity.CUDA,
+    #     ],
+    #     # schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True,
+    #     on_trace_ready=trace_handler,
+    #     use_cuda=True
+    # ) as prof:
+
+        for batch_idx, batch in enumerate(dataloader):
+            # prof.step()
+
+            global_step += 1
+            local_step += 1
             
-            # Get the optimizer memory usage
-            optimizer_memory_usage, optimizer_tt_memory_usage = calculate_optimizer_memory_usage(optimizer)
-            full_optimizer_memory_usage = optimizer_memory_usage + optimizer_tt_memory_usage
-            full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
+            if update_step > args.num_training_steps:
+                logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
+                print(f"Rank {global_rank} stopping training.")
+
+                import socket
+                TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+
+                host_name = socket.gethostname()
+                timestamp = datetime.now().strftime(TIME_FORMAT_STR)
+                file_prefix = f"{host_name}_{timestamp}"
+
+                # torch.cuda.memory._record_memory_history(enabled=None)
+                # Disable the profiling.
+                # prof.stop()
+
+                # # Construct the memory timeline file.
+                # print("Device", device)
+                # prof.export_memory_timeline(f"{file_prefix}.html", device=device)
             
-            # print new line 
-            print("\n")
-            logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
-            logger.info(f"  -> tensor-train : {optimizer_tt_memory_usage / (1024 * 1024):.2f} MiB")
-            logger.info(f"  -> standard : {optimizer_memory_usage / (1024 * 1024):.2f} MiB")
+                break
+            
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch["input_ids"].clone()
+            labels[labels == pad_idx] = -100
+            tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
+            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## forward ##")):
+            # with record_function("## forward ##"):
+            loss = model(**batch, labels=labels).loss
+            scaled_loss = loss / args.gradient_accumulation
+            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## backward ##")):
+            # with record_function("## backward ##"):
+            scaled_loss.backward()
 
-        optimizer.step()
-        # torch.autograd.set_detect_anomaly(True)
-        scheduler.step()
-        optimizer.zero_grad()
+            if global_step % args.gradient_accumulation != 0:
+                continue
 
-        update_step += 1
-        update_time = time.time() - update_time
+            if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
-
-
-        
-        if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-            current_model_directory = f"{args.save_dir}/model_{update_step}"
-            logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-            os.makedirs(args.save_dir, exist_ok=True)
-
-            # Check if DistributedDataParallel is used
-            if args.single_gpu:
-                model.save_pretrained(current_model_directory, max_shard_size='100GB')
-            else:
-                model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
-
-            optimizer_checkpoint = {
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "update_step": update_step,
-                "global_step": global_step,
-                "config": run_config,
-                "wandb": wandb.run.dir,
-                "dtype": args.dtype,
-            }
-            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
-            training_state_checkpoint = {
-                "global_step": global_step,
-                "update_step": update_step,
-                "tokens_seen": tokens_seen,
-                "tokens_seen_before": tokens_seen_before,
-                "update_time": update_time,
-            }
-            with open(f"{current_model_directory}/training_state.json", "w") as f:
-                json.dump(training_state_checkpoint, f, indent=4)
+            if global_rank == 0: pbar.update(1)
+            if update_step == 50:
                 
-            # save wandb related info
-            wandb_info = {
-                "wandb_id": wandb.run.id,
-            }
-            with open(f"{args.save_dir}/wandb.json", "w") as f:
-                json.dump(wandb_info, f, indent=4)
+                # Get the optimizer memory usage
+                optimizer_memory_usage, optimizer_tt_memory_usage = calculate_optimizer_memory_usage(optimizer)
+                full_optimizer_memory_usage = optimizer_memory_usage + optimizer_tt_memory_usage
+                full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
+                
+                # print new line 
+                print("\n")
+                logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
+                logger.info(f"  -> tensor-train : {optimizer_tt_memory_usage / (1024 * 1024):.2f} MiB")
+                logger.info(f"  -> standard : {optimizer_memory_usage / (1024 * 1024):.2f} MiB")
 
-        if update_step % args.eval_every == 0:
-            logger.info(f"Performing evaluation at step {update_step}")
-            total_loss, evaluated_on_tokens = evaluate_model(
-                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
-            )
+            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## optimizer ##")):
+            # with record_function("## optimizer ##"):
+            optimizer.step()
+            optimizer.zero_grad()
+            # torch.autograd.set_detect_anomaly(True)
+            scheduler.step()
+
+            update_step += 1
+            update_time = time.time() - update_time
+
+
+
+            
+            if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+                current_model_directory = f"{args.save_dir}/model_{update_step}"
+                logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
+                os.makedirs(args.save_dir, exist_ok=True)
+
+                # Check if DistributedDataParallel is used
+                if args.single_gpu:
+                    model.save_pretrained(current_model_directory, max_shard_size='100GB')
+                else:
+                    model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
+
+                optimizer_checkpoint = {
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "update_step": update_step,
+                    "global_step": global_step,
+                    "config": run_config,
+                    "wandb": wandb.run.dir,
+                    "dtype": args.dtype,
+                }
+                torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+                training_state_checkpoint = {
+                    "global_step": global_step,
+                    "update_step": update_step,
+                    "tokens_seen": tokens_seen,
+                    "tokens_seen_before": tokens_seen_before,
+                    "update_time": update_time,
+                }
+                with open(f"{current_model_directory}/training_state.json", "w") as f:
+                    json.dump(training_state_checkpoint, f, indent=4)
+                    
+                # save wandb related info
+                wandb_info = {
+                    "wandb_id": wandb.run.id,
+                }
+                with open(f"{args.save_dir}/wandb.json", "w") as f:
+                    json.dump(wandb_info, f, indent=4)
+
+            if update_step % args.eval_every == 0:
+                logger.info(f"Performing evaluation at step {update_step}")
+                total_loss, evaluated_on_tokens = evaluate_model(
+                    model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+                )
+                if global_rank == 0:
+                    wandb.log({
+                        "final_eval_loss": total_loss,
+                        "final_eval_tokens": evaluated_on_tokens,
+                        },
+                        step=global_step,
+                    )
+                logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
+            lr = optimizer.param_groups[0]["lr"]
+            
+            tokens_in_update = tokens_seen - tokens_seen_before
+            tokens_seen_before = tokens_seen
+
             if global_rank == 0:
                 wandb.log({
-                    "final_eval_loss": total_loss,
-                    "final_eval_tokens": evaluated_on_tokens,
+                    "loss": loss.item(),
+                    "lr": lr,
+                    "update_step": update_step,
+                    "tokens_seen": tokens_seen,
+                    "throughput_tokens": tokens_in_update / update_time,
+                    "throughput_examples": args.total_batch_size / update_time,
                     },
                     step=global_step,
                 )
-            logger.info(f"Eval loss at step {update_step}: {total_loss}")
+            update_time = time.time()
 
-        lr = optimizer.param_groups[0]["lr"]
-        
-        tokens_in_update = tokens_seen - tokens_seen_before
-        tokens_seen_before = tokens_seen
-
-        if global_rank == 0:
-            wandb.log({
-                "loss": loss.item(),
-                "lr": lr,
-                "update_step": update_step,
-                "tokens_seen": tokens_seen,
-                "throughput_tokens": tokens_in_update / update_time,
-                "throughput_examples": args.total_batch_size / update_time,
-                },
-                step=global_step,
-            )
-        update_time = time.time()
-
-def cleanup():
+def cleanup(profiler, name):
+    logger.info("Cleaning up")
     if args.monitor_memory:
         try:
-            torch.cuda.memory._dump_snapshot(f"memory.pickle")
+            torch.cuda.memory._dump_snapshot(f"{name}.pickle")
         except Exception as e:
             logger.error(f"Failed to capture memory snapshot {e}")
 
         # Stop recording memory snapshot history.
-        torch.cuda.memory._record_memory_history(enabled=None)
 
-atexit.register(cleanup)
+        logger.info("Stopping memory profiling")
+        # profiler.export_memory_timeline(f"memory.html", row_limit=100_000)
+        # logger.info("Memory timeline exported to memory.html")
+        
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 import os
 import math
@@ -799,7 +919,79 @@ def calculate_batch_memory_usage(batch, labels):
     memory_usage += labels.nelement() * labels.element_size()
     return memory_usage
 
+def modify_model(model, args, device):
+    layers = [
+        ("self_attn", "q_proj"),
+        ("self_attn", "k_proj"),
+        ("self_attn", "v_proj"),
+        ("self_attn", "o_proj"),
+        ("mlp", "gate_proj"),
+        ("mlp", "up_proj"),
+        ("mlp", "down_proj"),
+    ]
+
+    if args.architecture == "linear":
+        return model
+
+    for i in range(len(model.model.layers)):
+        for module, attr in layers:
+            layer = model.model.layers[i].__getattr__(module).__getattr__(attr)
+            
+            if args.architecture == "ttlinear":
+                new_layer = TensorTrainLinear(
+                    in_features=layer.in_features,
+                    out_features=layer.out_features,
+                    ranks=[1] + [args.rank] * (args.order - 1) + [1],
+                    device=device,
+                    bias=False,
+                    type=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
+                )
+            elif args.architecture == "sow":
+                new_layer = SumLinear(
+                    in_features=layer.in_features,
+                    out_features=layer.out_features,
+                    rank=args.rank,
+                    n_iter=args.n_iter,
+                    accumulation_steps=args.sow_acc_steps,
+                    device=device,
+                    bias=layer.bias is not None,
+                    dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
+                )
+            elif args.architecture == "sttlinear":
+                new_layer = SumTTLinear(
+                    in_features=layer.in_features,
+                    out_features=layer.out_features,
+                    order=args.order,
+                    n_iter=args.n_iter,
+                    inner_rank=args.inner_rank,
+                    outer_rank=args.rank,
+                    device=device,
+                    bias=False,
+                    dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
+                )
+
+
+            model.model.layers[i].__getattr__(module).__setattr__(attr, new_layer)
+
+    return model
+
 if __name__ == "__main__":
     print("Starting script")
     args = parse_args(None)
+
+    profiler = cProfile.Profile()
+
+    profiler.enable()
     main(args)
+    profiler.disable()
+
+    from io import StringIO
+    import pstats
+
+    s = StringIO()
+    ps = pstats.Stats(profiler, stream=s).sort_stats('cumtime')
+    X = 30
+    ps.print_stats(X)
+    print(s.getvalue())
+
+    # profiler.print_stats(sort='cumtime')
