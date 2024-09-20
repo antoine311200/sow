@@ -68,7 +68,7 @@ class SoWLinear(nn.Module):
         self.step = 0
         self.mingle_every = 200
 
-        self.accumulate_every = accumulation_steps * 2 # To account for the forward in the backward pass
+        self.accumulate_every = accumulation_steps 
         self.accumulated_weight = None
 
         self.downscale_weights = SoWParameter(
@@ -84,6 +84,12 @@ class SoWLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.reset_parameters()
+
+        # Add a hook to step the model at each backward pass
+        self.register_full_backward_hook(self._step)
+
+    def _step(self, module, grad_input, grad_output):
+        self.step += 1
 
     def reset_parameters(self, reset_scale=1.0) -> None:
 
@@ -103,12 +109,11 @@ class SoWLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get if training
         if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
             self.accumulate()
 
         if self.accumulated_weight is not None:
-            out = x @ self.accumulated_weight
+            out = x @ self.accumulated_weight.to(x.device)
         else:
             out = None
 
@@ -123,7 +128,6 @@ class SoWLinear(nn.Module):
         if self.bias is not None:
             out += self.bias
 
-        self.step += 1
         return out
     
     def accumulate(self):
@@ -131,18 +135,23 @@ class SoWLinear(nn.Module):
         if self.accumulated_weight is None:
             self.accumulated_weight = accumalation
         else:
-            self.accumulated_weight += accumalation
+            self.accumulated_weight = self.accumulated_weight.to(accumalation.device) + accumalation
 
         self.accumulated_weight = self.accumulated_weight.detach().to(self.downscale_weights[0].device)
 
         # Reset weights
         new_downscale_weights = [torch.zeros_like(x) for x in self.downscale_weights]
         new_upscale_weights = [torch.zeros_like(x) for x in self.upscale_weights]
-        for i in range(len(self.upscale_weights)):
+        # Change initializations with random canceling
+        for i in range(0, self.n_iter):
             nn.init.kaiming_uniform_(new_upscale_weights[i], a=sqrt(5))
+            nn.init.kaiming_uniform_(new_downscale_weights[i], a=sqrt(5))
 
         self.downscale_weights.from_weights(new_downscale_weights)
         self.upscale_weights.from_weights(new_upscale_weights)
+
+        random_accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()
+        self.accumulated_weight = self.accumulated_weight - random_accumalation
 
     def mingle(self):
         scale = 1 / self.n_iter
