@@ -33,8 +33,19 @@ def prepare_sow(
         nn.Module: The prepared model.
     """
     layers_to_replace = {}
+
+    max_split = max([len(name.split(".")) for name in target_modules])
+
+    def check_module(name, module):
+        split_name = name.split(".")
+        if isinstance(module, nn.Linear):
+            for i in range(1, min(max_split + 1, len(split_name))):
+                if ".".join(split_name[-i:]) in target_modules:
+                    return True
+        return False
+
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and name.split(".")[-1] in target_modules:
+        if check_module(name, module):
             layers_to_replace[name] = module
 
     for name, module in layers_to_replace.items():
@@ -92,6 +103,6 @@ def prepare_sow(
             parent_module = dict(model.named_modules())[parent_name]
             setattr(parent_module, child_name, new_layer)
         else:
-            setattr(model, name, new_linear)
+            setattr(model, name, new_layer)
 
     return model
