@@ -6,9 +6,18 @@ from opt_einsum import contract_expression, contract_path
 from math import sqrt
 from typing import Tuple, List
 
+from dataclasses import dataclass
 
+@dataclass
+class SoWArgs:
+    device: str = None
+    dtype: torch.dtype = None
 
-class SumParameter(nn.ParameterList):
+    rank: int = 16
+    n_iter: int = 5
+    accumulation_steps: int = 200
+
+class SoWParameter(nn.ParameterList):
 
     def __init__(
         self,
@@ -19,7 +28,7 @@ class SumParameter(nn.ParameterList):
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(SumParameter, self).__init__(
+        super(SoWParameter, self).__init__(
             [
                 nn.Parameter(torch.empty(in_features, out_features, **factory_kwargs))
                 for _ in range(n_iter)
@@ -31,14 +40,13 @@ class SumParameter(nn.ParameterList):
 
     def from_weights(self, weights: List[torch.Tensor]) -> None:
         for i, weight in enumerate(weights):
-            print(i, weight.shape, self[i].shape)
             self[i].data = weight.data
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.in_features}, {self.out_features}, n_iter={self.n_iter})"
 
 
-class SumLinear(nn.Module):
+class SoWLinear(nn.Module):
 
     def __init__(
         self,
@@ -48,25 +56,29 @@ class SumLinear(nn.Module):
         rank: int = 16,
         n_iter: int = 5,
         accumulation_steps: int = 200,
+        init_method: str = "zero_kaiming",
+        buffer_proj: bool = False,
         device=None,
         dtype=None,
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
-        super(SumLinear, self).__init__()
+        super(SoWLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.n_iter = n_iter
         self.rank = rank
         self.step = 0
-        self.mingle_every = 200
+        self.buffer_proj = buffer_proj
 
-        self.accumulate_every = accumulation_steps * 2 # To account for the forward in the backward pass
+        self.accumulate_every = accumulation_steps 
         self.accumulated_weight = None
 
-        self.downscale_weights = SumParameter(
+        self.init_method = init_method
+
+        self.downscale_weights = SoWParameter(
             in_features, rank, n_iter=n_iter, device=device, dtype=dtype
         )
-        self.upscale_weights = SumParameter(
+        self.upscale_weights = SoWParameter(
             rank, out_features, n_iter=n_iter, device=device, dtype=dtype
         )
 
@@ -75,7 +87,17 @@ class SumLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+        if self.buffer_proj:
+            self.register_buffer("proj_row", torch.eye(self.out_features))
+            self.register_buffer("proj_col", torch.eye(self.in_features))
+
         self.reset_parameters()
+
+        # Add a hook to step the model at each backward pass
+        self.register_full_backward_hook(self._step)
+
+    def _step(self, module, grad_input, grad_output):
+        self.step += 1
 
     def reset_parameters(self, reset_scale=1.0) -> None:
 
@@ -95,7 +117,6 @@ class SumLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Get if training
         if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
             self.accumulate()
 
@@ -104,36 +125,83 @@ class SumLinear(nn.Module):
         else:
             out = None
 
+        # stacked_downscale_weights = torch.stack([w for w in self.downscale_weights]) # Shape: (n, in_features, rank)
+        # stacked_upscale_weights = torch.stack([w for w in self.upscale_weights]) # Shape: (n, rank, out_features)
+
+        # # print("Stacked downscale weights:", stacked_downscale_weights.shape)
+        # # print("Stacked upscale weights:", stacked_upscale_weights.shape)
+
+        # x_expanded = x.unsqueeze(0).expand(self.n_iter, -1, -1, -1)
+        # x_expanded = x_expanded.view(self.n_iter, x.size(0) * x.size(1), -1) # Shape: (n, batch * length, in_features)
+
+        # # print("Expanded input:", x_expanded.shape)
+
+        # intermediate = torch.bmm(x_expanded, stacked_downscale_weights) # Shape: (n, batch * length, rank)
+        # intermediate = torch.bmm(intermediate, stacked_upscale_weights) # Shape: (n, batch * length, out_features)
+
+        # intermediate = intermediate.view(self.n_iter, x.size(0), x.size(1), self.out_features) # Shape: (n, batch, length, out_features)
+        # intermediate = intermediate.sum(dim=0) # Shape: (batch, length, out_features)
+
+        # if out is not None: out += intermediate
+        # else: out = intermediate
+
         for downscale_weight, upscale_weight in zip(
             self.downscale_weights, self.upscale_weights
         ):
+            output = x @ downscale_weight
+            output = output @ upscale_weight
             if out is not None:
-                out += x @ (downscale_weight @ upscale_weight)
+                out += output
             else:
-                out = x @ (downscale_weight @ upscale_weight)
+                out = output
 
         if self.bias is not None:
             out += self.bias
 
-        self.step += 1
         return out
     
     def accumulate(self):
         accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()#.cpu().numpy()
+
         if self.accumulated_weight is None:
             self.accumulated_weight = accumalation
         else:
-            self.accumulated_weight += accumalation
+            self.accumulated_weight = self.accumulated_weight.to(accumalation.device) + accumalation
 
         self.accumulated_weight = self.accumulated_weight.detach().to(self.downscale_weights[0].device)
+        self.accumulated_weight.requires_grad = False
+
+        if self.buffer_proj:
+            W = self.accumulated_weight
+            self.proj_row = torch.eye(W.size(1), device=W.device) - W.t() @ torch.inverse(W @ W.t()) @ W
+            self.proj_col = torch.eye(W.size(0), device=W.device) - W @ torch.inverse(W.t() @ W) @ W.t()
 
         # Reset weights
-        for _, (downscale_weight, upscale_weight) in enumerate(
-            zip(self.downscale_weights, self.upscale_weights)
-        ):
-            downscale_weight = torch.zeros_like(downscale_weight)
-            # nn.init.kaiming_uniform_(downscale_weight, a=sqrt(5))
-            nn.init.kaiming_uniform_(upscale_weight, a=sqrt(5))
+        new_downscale_weights = [torch.zeros_like(x) for x in self.downscale_weights]
+        new_upscale_weights = [torch.zeros_like(x) for x in self.upscale_weights]
+
+        # Change initializations with random canceling
+        for i in range(0, self.n_iter):
+            if self.init_method == "kaiming_kaiming":
+                nn.init.kaiming_uniform_(new_upscale_weights[i], a=sqrt(5))
+            nn.init.kaiming_uniform_(new_downscale_weights[i], a=sqrt(5))
+
+        self.downscale_weights.from_weights(new_downscale_weights)
+        self.upscale_weights.from_weights(new_upscale_weights)
+        
+        if self.init_method == "kaiming_kaiming":
+            random_accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()
+            self.accumulated_weight = self.accumulated_weight - random_accumalation
+
+    def project_grad(self):
+        """Use the buffered projector onto the orthogonal complement of the accumulated weight
+        rowspace and colspace on the gradient of the downscale and upscale weights."""
+        if self.buffer_proj:
+            with torch.no_grad():
+                for i in range(0, self.n_iter):
+                    if self.downscale_weights[i].data.grad is not None:
+                        self.downscale_weights[i].data.grad = self.downscale_weights[i].data.grad @ self.proj_col
+                        self.upscale_weights[i].data.grad = self.proj_row @ self.upscale_weights[i].data.grad
 
 
     def mingle(self):
