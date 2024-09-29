@@ -32,7 +32,8 @@ from tn_gradient.optimizer.ttsgd import TTSGD
 from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
 from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sumlinear import SumLinear, SumTTLinear
+from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
+from tn_gradient.prepare import prepare_sow
 
 from galore_torch import GaLoreAdamW
 
@@ -187,14 +188,14 @@ def main(args):
     logger.info(f"Gradient accumulation: {args.gradient_accumulation}")
 
     if args.architecture == "sow":
-        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}"
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.lr}-n-{args.n_iter}-r-{args.rank}-{args.sow_acc_steps}"
     elif args.architecture == "sttlinear":
         run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}-o-{args.order}-i-{args.inner_rank}"
     else:
         run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}"
 
     if global_rank != 0: logger.remove()
-    if global_rank == 0: wandb.init(project="tn-gradient-roberta", name=run_name)
+    if global_rank == 0: wandb.init(project="sow-llama", name=run_name)
     
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -232,7 +233,13 @@ def main(args):
     model_config = AutoConfig.from_pretrained(args.model_config)
     model = AutoModelForCausalLM.from_config(model_config)
 
-    model = modify_model(model, args, device)
+    # model = modify_model(model, args, device)
+    if args.architecture == "sow":
+        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_acc_steps)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
+
+    print(model)
 
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
@@ -357,9 +364,12 @@ def main(args):
     scheduler = get_scheculer(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
-        num_training_steps=args.num_training_steps,
+        num_training_steps=args.num_training_steps if args.architecture != "sow" else args.sow_acc_steps,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
+        cycle_length=None if args.architecture != "sow" else args.sow_acc_steps,
+        restart_warmup_steps=args.warmup_steps,
+        cycle_ratio=1.0 if args.architecture != "sow" else 0.85,
     )
 
     if not args.single_gpu:
@@ -691,6 +701,7 @@ def get_scheculer(
     restart_warmup_steps=None,
     adjust_step=0,
     last_epoch=-1,
+    cycle_ratio=1.0,
 ):
     if adjust_step != 0 and scheduler_type != "cosine_restarts":
         raise ValueError("adjust_step is only supported for cosine_restarts scheduler")
@@ -710,6 +721,7 @@ def get_scheculer(
             cycle_length=cycle_length,
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
+            cycle_ratio=cycle_ratio,
         )
     if scheduler_type == "cosine_restarts":
         assert restart_warmup_steps is not None, "restart_warmup_steps must be specified for cosine_restarts scheduler"
@@ -722,12 +734,13 @@ def get_scheculer(
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
             adjust_step=adjust_step,
+            cycle_ratio=cycle_ratio,
         )
 
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
 
 
-def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1):
+def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1, cycle_ratio=1.0):
     assert cycle_length is not None or num_training_steps is not None, "You must specify either cycle_length or num_training_steps"
     
     if cycle_length is None:
@@ -741,6 +754,7 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_tr
         num_warmup_steps=num_warmup_steps,
         cycle_length=cycle_length,
         min_lr_ratio=min_lr_ratio,
+        cycle_ratio=cycle_ratio
     )
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
@@ -773,6 +787,23 @@ def get_cosine_schedule_with_multiple_warmups(
     )
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
+def get_cosine_schedule_with_accumulation(
+    optimizer,
+    *,
+    cycle_warmup_steps,
+    cycle_length,
+    min_lr_ratio=0.1,
+    last_epoch=-1,
+    adjust_step=0,
+):
+    lr_lambda = partial(
+        _get_cosine_schedule_with_accumulation_lambda,
+        cycle_warmup_steps=cycle_warmup_steps,
+        cycle_length=cycle_length,
+        min_lr_ratio=min_lr_ratio,
+        adjust_step=adjust_step,
+    )
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 @torch.no_grad()
 def random_pruning(tensor, prune_ratio):
@@ -799,22 +830,23 @@ def magnitude_pruning(tensor, prune_ratio):
     return tensor
 
 
-def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
+def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio, cycle_ratio=1.0):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
 
     # compute where we are in the current cycle
     cycle_step = current_step % cycle_length
+    cycle_number = current_step // cycle_length
 
     if cycle_step < num_warmup_steps:
         if current_step != cycle_step:
             if cycle_step < 2:
                 return 1e-7
-        return float(cycle_step) / float(max(1, num_warmup_steps))
+        return float(cycle_step) / float(max(1, num_warmup_steps)) / (cycle_number / cycle_ratio if cycle_number > 0 else 1.0)
 
-    progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps))
+    progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps)) 
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+    return (min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay) / (cycle_number / cycle_ratio if cycle_number > 0 else 1.0)
 
 
 def _get_cosine_schedule_with_multiple_warmups_lambda(
@@ -864,6 +896,27 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
 
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
+
+def _get_cosine_schedule_with_accumulation_lambda(
+    current_step,
+    *,
+    cycle_warmup_steps,
+    cycle_length,
+    min_lr_ratio,
+    adjust_step,
+):
+    cycle_step = current_step % cycle_length
+
+    if cycle_step < num_warmup_steps:
+        if current_step != cycle_step:
+            if cycle_step < 2:
+                return 1e-7
+        return float(cycle_step) / float(max(1, cycle_warmup_steps))
+
+    progress = float(cycle_step - cycle_warmup_steps) / float(max(1, cycle_length - cycle_warmup_steps))
+    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+    
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 def collate_fn(batch_list):
     batch = {
@@ -947,7 +1000,7 @@ def modify_model(model, args, device):
                     type=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
                 )
             elif args.architecture == "sow":
-                new_layer = SumLinear(
+                new_layer = SoWLinear(
                     in_features=layer.in_features,
                     out_features=layer.out_features,
                     rank=args.rank,
@@ -969,7 +1022,6 @@ def modify_model(model, args, device):
                     bias=False,
                     dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
                 )
-
 
             model.model.layers[i].__getattr__(module).__setattr__(attr, new_layer)
 
