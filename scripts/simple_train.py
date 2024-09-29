@@ -63,7 +63,7 @@ def parse_args(args):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--nesterov", action="store_true")
-    parser.add_argument("--warmup_steps", type=int, default=1_000)
+    parser.add_argument("--warmup_steps", type=float, default=0.1)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=1_000)
@@ -80,11 +80,13 @@ def parse_args(args):
 
     # Tensor Train parameters
     parser.add_argument("--architecture", type=str, default="linear")
-    parser.add_argument("--sow_acc_steps", type=int, default=200)
-    parser.add_argument("--order", type=int, default="6") # Only for TT layers
+    parser.add_argument("--sow_accumulation", type=int, default=200)
+    parser.add_argument("--sow_lr", type=float, default=0.0015)
     parser.add_argument("--rank", type=int, default="4")
-    parser.add_argument("--inner_rank", type=int, default="6") # Only for TT layers
     parser.add_argument("--n_iter", type=int, default="4")
+    parser.add_argument("--lr_decay", type=float, default="1.0")
+    # parser.add_argument("--order", type=int, default="6") # Only for TT layers
+    # parser.add_argument("--inner_rank", type=int, default="6") # Only for TT layers
 
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
@@ -188,7 +190,7 @@ def main(args):
     logger.info(f"Gradient accumulation: {args.gradient_accumulation}")
 
     if args.architecture == "sow":
-        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.lr}-n-{args.n_iter}-r-{args.rank}-{args.sow_acc_steps}"
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.lr}-n-{args.n_iter}-r-{args.rank}-{args.sow_accumulation}"
     elif args.architecture == "sttlinear":
         run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}-o-{args.order}-i-{args.inner_rank}"
     else:
@@ -234,10 +236,29 @@ def main(args):
     model = AutoModelForCausalLM.from_config(model_config)
 
     # model = modify_model(model, args, device)
+    sow_params = []
     if args.architecture == "sow":
-        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_acc_steps)
+        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_accumulation)
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
+
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+            
+            print('enable SoW training for for weights in module: ', module_name, 'with shape: ', list(module.upscale_weights.shape), '+', list(module.downscale_weights.shape))
+
+            for downscale_weight in module.downscale_weights:
+                sow_params.append(downscale_weight)
+            for upscale_weight in module.upscale_weights:
+                sow_params.append(upscale_weight)
+        id_params = [id(p) for p in sow_params]
+        trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
 
     print(model)
 
@@ -247,7 +268,6 @@ def main(args):
         model = model.to(device=device)
 
     n_total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
@@ -353,23 +373,22 @@ def main(args):
             weight_decay=args.weight_decay,
         )
     elif args.optimizer.lower() == "Adam".lower():
-        optimizer = torch.optim.Adam(
-            trainable_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.Adam([
+            {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': sow_params, 'lr': args.sow_lr, 'weight_decay': args.weight_decay}
+        ])
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
-    scheduler = get_scheculer(
+    scheduler = get_all_schedulers(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
-        num_training_steps=args.num_training_steps if args.architecture != "sow" else args.sow_acc_steps,
+        num_training_steps=args.num_training_steps if args.architecture != "sow" else (args.num_training_steps, args.sow_accumulation),
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
-        cycle_length=None if args.architecture != "sow" else args.sow_acc_steps,
+        cycle_length=None if args.architecture != "sow" else (None, args.sow_accumulation),
         restart_warmup_steps=args.warmup_steps,
-        cycle_ratio=1.0 if args.architecture != "sow" else 0.85,
+        cycle_ratio=1.0 if args.architecture != "sow" else (1.0, args.lr_decay),
     )
 
     if not args.single_gpu:
@@ -558,6 +577,10 @@ def main(args):
                 logger.info(f"Eval loss at step {update_step}: {total_loss}")
 
             lr = optimizer.param_groups[0]["lr"]
+            if len(optimizer.param_groups) > 1:
+                sow_lr = optimizer.param_groups[1]["lr"]
+            else:
+                sow_lr = None
             
             tokens_in_update = tokens_seen - tokens_seen_before
             tokens_seen_before = tokens_seen
@@ -566,6 +589,7 @@ def main(args):
                 wandb.log({
                     "loss": loss.item(),
                     "lr": lr,
+                    "sow_lr": sow_lr,
                     "update_step": update_step,
                     "tokens_seen": tokens_seen,
                     "throughput_tokens": tokens_in_update / update_time,
@@ -688,6 +712,40 @@ def check_args_torchrun_main(args):
 
 
 
+def get_all_schedulers(
+    optimizer,
+    *,
+    scheduler_type,
+    num_training_steps,
+    warmup_steps,
+    min_lr_ratio,
+    cycle_length=None,
+    restart_warmup_steps=None,
+    adjust_step=0,
+    last_epoch=-1,
+    cycle_ratio=1.0,
+):
+    if not isinstance(num_training_steps, tuple):
+        num_training_steps = (num_training_steps,)
+
+    lambda_schedulers = []
+    for i in range(len(num_training_steps)):
+        scheduler = get_scheculer(
+            optimizer,
+            scheduler_type=scheduler_type,
+            num_training_steps=num_training_steps[i],
+            warmup_steps=warmup_steps,
+            min_lr_ratio=min_lr_ratio,
+            cycle_length=cycle_length[i],
+            restart_warmup_steps=restart_warmup_steps,
+            adjust_step=adjust_step,
+            last_epoch=last_epoch,
+            cycle_ratio=cycle_ratio[i],
+            param_group_indices=[i],
+        )
+        lambda_schedulers.append(scheduler)
+    
+    return LambdaLR(optimizer, lambda_schedulers, last_epoch)
 
 
 def get_scheculer(
@@ -702,11 +760,15 @@ def get_scheculer(
     adjust_step=0,
     last_epoch=-1,
     cycle_ratio=1.0,
+    param_group_indices=None,
 ):
     if adjust_step != 0 and scheduler_type != "cosine_restarts":
         raise ValueError("adjust_step is only supported for cosine_restarts scheduler")
 
+    warmup_steps = int(warmup_steps * num_training_steps)
+
     if scheduler_type == "linear":
+        # NO GROUP INDICES!
         return transformers.get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
@@ -722,6 +784,7 @@ def get_scheculer(
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
             cycle_ratio=cycle_ratio,
+            param_group_indices=param_group_indices,
         )
     if scheduler_type == "cosine_restarts":
         assert restart_warmup_steps is not None, "restart_warmup_steps must be specified for cosine_restarts scheduler"
@@ -735,12 +798,13 @@ def get_scheculer(
             last_epoch=last_epoch,
             adjust_step=adjust_step,
             cycle_ratio=cycle_ratio,
+            param_group_indices=param_group_indices,
         )
 
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
 
 
-def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1, cycle_ratio=1.0):
+def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1, cycle_ratio=1.0, param_group_indices=None):
     assert cycle_length is not None or num_training_steps is not None, "You must specify either cycle_length or num_training_steps"
     
     if cycle_length is None:
@@ -756,7 +820,7 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_tr
         min_lr_ratio=min_lr_ratio,
         cycle_ratio=cycle_ratio
     )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return lr_lambda
 
 
 def get_cosine_schedule_with_multiple_warmups(
@@ -785,25 +849,7 @@ def get_cosine_schedule_with_multiple_warmups(
         min_lr_ratio=min_lr_ratio,
         adjust_step=adjust_step,
     )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-def get_cosine_schedule_with_accumulation(
-    optimizer,
-    *,
-    cycle_warmup_steps,
-    cycle_length,
-    min_lr_ratio=0.1,
-    last_epoch=-1,
-    adjust_step=0,
-):
-    lr_lambda = partial(
-        _get_cosine_schedule_with_accumulation_lambda,
-        cycle_warmup_steps=cycle_warmup_steps,
-        cycle_length=cycle_length,
-        min_lr_ratio=min_lr_ratio,
-        adjust_step=adjust_step,
-    )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return lr_lambda
 
 @torch.no_grad()
 def random_pruning(tensor, prune_ratio):
@@ -841,12 +887,12 @@ def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup
         if current_step != cycle_step:
             if cycle_step < 2:
                 return 1e-7
-        return float(cycle_step) / float(max(1, num_warmup_steps)) / (cycle_number / cycle_ratio if cycle_number > 0 else 1.0)
+        return float(cycle_step) / float(max(1, num_warmup_steps)) * (cycle_ratio ** cycle_number)
 
     progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps)) 
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    return (min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay) / (cycle_number / cycle_ratio if cycle_number > 0 else 1.0)
+    return (min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay) * (cycle_ratio ** cycle_number)
 
 
 def _get_cosine_schedule_with_multiple_warmups_lambda(
@@ -894,28 +940,6 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     progress = float(_current_step - first_warmup_steps) / float(max(1, num_training_steps - first_warmup_steps))
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-
-
-def _get_cosine_schedule_with_accumulation_lambda(
-    current_step,
-    *,
-    cycle_warmup_steps,
-    cycle_length,
-    min_lr_ratio,
-    adjust_step,
-):
-    cycle_step = current_step % cycle_length
-
-    if cycle_step < num_warmup_steps:
-        if current_step != cycle_step:
-            if cycle_step < 2:
-                return 1e-7
-        return float(cycle_step) / float(max(1, cycle_warmup_steps))
-
-    progress = float(cycle_step - cycle_warmup_steps) / float(max(1, cycle_length - cycle_warmup_steps))
-    cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-    
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
 def collate_fn(batch_list):
@@ -1005,7 +1029,7 @@ def modify_model(model, args, device):
                     out_features=layer.out_features,
                     rank=args.rank,
                     n_iter=args.n_iter,
-                    accumulation_steps=args.sow_acc_steps,
+                    accumulation_steps=args.sow_accumulation,
                     device=device,
                     bias=layer.bias is not None,
                     dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,

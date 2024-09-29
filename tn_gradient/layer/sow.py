@@ -38,6 +38,8 @@ class SoWParameter(nn.ParameterList):
         self.out_features = out_features
         self.n_iter = n_iter
 
+        self.shape = (self.n_iter, self.in_features, self.out_features)
+
     def from_weights(self, weights: List[torch.Tensor]) -> None:
         for i, weight in enumerate(weights):
             self[i].data = weight.data
