@@ -39,6 +39,9 @@ def prepare_sow(
     def check_module(name, module):
         split_name = name.split(".")
         if isinstance(module, nn.Linear):
+            if len(split_name) == 1 and split_name[0] in target_modules:
+                return True
+
             for i in range(1, min(max_split + 1, len(split_name))):
                 if ".".join(split_name[-i:]) in target_modules:
                     return True
