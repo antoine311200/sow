@@ -32,7 +32,8 @@ from tn_gradient.optimizer.ttsgd import TTSGD
 from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
 from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sumlinear import SumLinear, SumTTLinear
+from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
+from tn_gradient.prepare import prepare_sow
 
 from galore_torch import GaLoreAdamW
 
@@ -62,7 +63,7 @@ def parse_args(args):
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--nesterov", action="store_true")
-    parser.add_argument("--warmup_steps", type=int, default=1_000)
+    parser.add_argument("--warmup_steps", type=float, default=0.1)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=1_000)
@@ -77,19 +78,23 @@ def parse_args(args):
     parser.add_argument("--gradient_accumulation", type=int, default=None)
     parser.add_argument("--monitor_memory", type=bool, default=False)
 
-    # Tensor Train parameters
+    # Sum Of (LO) Weight parameters
     parser.add_argument("--architecture", type=str, default="linear")
-    parser.add_argument("--sow_acc_steps", type=int, default=200)
-    parser.add_argument("--order", type=int, default="6") # Only for TT layers
+    parser.add_argument("--sow_accumulation", type=int, default=200)
+    parser.add_argument("--sow_lr", type=float, default=0.0015)
     parser.add_argument("--rank", type=int, default="4")
-    parser.add_argument("--inner_rank", type=int, default="6") # Only for TT layers
     parser.add_argument("--n_iter", type=int, default="4")
+    parser.add_argument("--lr_decay", type=float, default="1.0")
 
+    # Galore parameters
+    parser.add_argument("--galore_rank", type=int, default="128")
+    parser.add_argument("--update_proj_gap", type=int, default="200")
+    parser.add_argument("--galore_scale", type=float, default="0.25")
+    parser.add_argument("--proj_type", type=str, default="std")
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
 
     args = parser.parse_args(args)
-    # args = check_args_torchrun_main(args)
 
     if args.total_batch_size is None:
         args.gradient_accumulation = args.gradient_accumulation or 1
@@ -187,14 +192,14 @@ def main(args):
     logger.info(f"Gradient accumulation: {args.gradient_accumulation}")
 
     if args.architecture == "sow":
-        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}"
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.sow_lr}-n-{args.n_iter}-r-{args.rank}-{args.sow_accumulation}"
     elif args.architecture == "sttlinear":
         run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-n-{args.n_iter}-r-{args.rank}-o-{args.order}-i-{args.inner_rank}"
     else:
-        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}"
+        run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.lr}"
 
     if global_rank != 0: logger.remove()
-    if global_rank == 0: wandb.init(project="tn-gradient-roberta", name=run_name)
+    if global_rank == 0: wandb.init(project="sow-llama", name=run_name)
     
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -232,7 +237,44 @@ def main(args):
     model_config = AutoConfig.from_pretrained(args.model_config)
     model = AutoModelForCausalLM.from_config(model_config)
 
-    model = modify_model(model, args, device)
+    special_params = []
+    if args.architecture == "sow":
+        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_accumulation)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
+
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+            
+            # print('enable SoW training for for weights in module: ', module_name, 'with shape: ', list(module.upscale_weights.shape), '+', list(module.downscale_weights.shape))
+
+            for downscale_weight in module.downscale_weights:
+                special_params.append(downscale_weight)
+            for upscale_weight in module.upscale_weights:
+                special_params.append(upscale_weight)
+        id_params = [id(p) for p in special_params]
+        trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
+    elif args.architecture == "galore":
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+
+            special_params.append(module.weight)
+            
+        id_params = [id(p) for p in special_params]
+        trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+
 
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
@@ -240,7 +282,6 @@ def main(args):
         model = model.to(device=device)
 
     n_total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     # Initialize wandb
     run_config = dict(vars(args))
     run_config.update({
@@ -264,102 +305,85 @@ def main(args):
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
     
 
-    if "TT".lower() in args.optimizer.lower() or "galore" in args.optimizer.lower():
-        tt_params = []
-        target_modules_list = ["attn", "mlp", "dense", "attention", "self_attn"]
-        for module_name, module in model.named_modules():
-            if not isinstance(module, nn.Linear):
-                continue
+    # if "TT".lower() in args.optimizer.lower() or "galore" in args.optimizer.lower():
+    #     tt_params = []
+    #     target_modules_list = ["attn", "mlp", "dense", "attention", "self_attn"]
+    #     for module_name, module in model.named_modules():
+    #         if not isinstance(module, nn.Linear):
+    #             continue
 
-            if not any(target_key in module_name for target_key in target_modules_list):
-                continue
+    #         if not any(target_key in module_name for target_key in target_modules_list):
+    #             continue
             
-            print('enable Tensor Train for for weights in module: ', module_name, 'with shape: ', list(module.weight.shape))
-            tt_params.append(module.weight)
-        id_tt_params = [id(p) for p in tt_params]
-        regular_params = [p for p in trainable_params if id(p) not in id_tt_params]
+    #         print('enable Tensor Train for for weights in module: ', module_name, 'with shape: ', list(module.weight.shape))
+    #         tt_params.append(module.weight)
+    #     id_tt_params = [id(p) for p in tt_params]
+    #     regular_params = [p for p in trainable_params if id(p) not in id_tt_params]
         
-        if "tt" in args.optimizer.lower():
-            param_groups = [
-                {"params": regular_params},
-                {"params": tt_params, "ranks": [1] + [int(args.rank)] * (int(args.order) - 1) + [1]},
-            ]
-        else:
-            param_groups = [
-                {"params": regular_params},
-                {"params": tt_params,
-                 'rank': 128,
-                 'update_proj_gap': 200,
-                 'scale': 0.25,
-                 'proj_type': "std"
-                }
-            ]
+    #     if "tt" in args.optimizer.lower():
+    #         param_groups = [
+    #             {"params": regular_params},
+    #             {"params": tt_params, "ranks": [1] + [int(args.rank)] * (int(args.order) - 1) + [1]},
+    #         ]
+    #     else:
+    #         param_groups = [
+    #             {"params": regular_params},
+    #             {"params": tt_params,
+    #              'rank': 128,
+    #              'update_proj_gap': 200,
+    #              'scale': 0.25,
+    #              'proj_type': "std"
+    #             }
+    #         ]
 
     logger.info(f"\n{model}\n")
     logger.info(f"Total params: {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
     logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
-    if "tt" in args.optimizer.lower() or "galore" in args.optimizer.lower():
-        logger.info(f"Total params with Tensor Train enabled: {sum(p.numel() for p in tt_params) / 1_000_000:.2f}M")
+    if args.architecture == "sow":
+        logger.info(f"SoW params: {sum(p.numel() for p in special_params) / 1_000_000:.2f}M")
 
     logger.info(f"Model memory usage: {calculate_model_memory_usage(model) / (1024 * 1024):.2f} MiB")
 
-    if args.optimizer.lower() == "TTSGD".lower():
-        optimizer = TTSGD(
-            param_groups,
-            lr=args.lr,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-            nesterov=args.nesterov,
-        )
-    elif args.optimizer.lower() == "SGD".lower():
+    if args.optimizer.lower() == "SGD".lower():
         optimizer = TTSGD(
             trainable_params,
             lr=args.lr,
             momentum=args.momentum,
             weight_decay=args.weight_decay,
             nesterov=args.nesterov,
-        )
-    elif args.optimizer.lower() == "TTAdam".lower():
-        optimizer = TTAdam(
-            param_groups,
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=args.weight_decay,
-            amsgrad=False,
-        )
-    elif args.optimizer.lower() == "TTRAdam".lower():
-        optimizer = TTRAdam(
-            param_groups,
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=args.weight_decay,
-            amsgrad=False,
         )
     elif args.optimizer.lower() == "galore_adamw":
-        optimizer = GaLoreAdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = GaLoreAdamW([
+            {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {
+                'params': special_params, 
+                'lr': args.sow_lr, 'weight_decay': args.weight_decay, 
+                'rank': args.galore_rank, 'update_proj_gap': args.update_proj_gap,
+                'scale': args.galore_scale, 'proj_type': args.proj_type
+            }
+        ])
     elif args.optimizer.lower() == "AdamW".lower():
-        optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.AdamW([
+            {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': special_params, 'lr': args.sow_lr, 'weight_decay': args.weight_decay}
+        ])
     elif args.optimizer.lower() == "Adam".lower():
-        optimizer = torch.optim.Adam(
-            trainable_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.Adam([
+            {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+            {'params': special_params, 'lr': args.sow_lr, 'weight_decay': args.weight_decay}
+        ])
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
-    scheduler = get_scheculer(
+    scheduler = get_all_schedulers(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
-        num_training_steps=args.num_training_steps,
+        num_training_steps=args.num_training_steps if args.architecture != "sow" else (args.num_training_steps, args.sow_accumulation),
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
+        cycle_length=None if args.architecture != "sow" else (None, args.sow_accumulation),
+        restart_warmup_steps=args.warmup_steps,
+        cycle_ratio=1.0 if args.architecture != "sow" else (1.0, args.lr_decay),
     )
 
     if not args.single_gpu:
@@ -378,192 +402,130 @@ def main(args):
     profiler = None
     if args.monitor_memory:
         torch.cuda.memory._record_memory_history(max_entries=100_000)
-
-        # profiler = torch.profiler.profile(
-        #     activities=[
-        #         torch.profiler.ProfilerActivity.CPU,
-        #         torch.profiler.ProfilerActivity.CUDA,
-        #     ],
-        #     schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
-        #     record_shapes=True,
-        #     profile_memory=True,
-        #     with_stack=True,
-        # )
         logger.info("Starting memory profiling")
 
     atexit.register(cleanup, profiler, run_name)
 
-    # def trace_handler(prof: torch.profiler.profile):
-    #     import socket
-    #     TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+    for _, batch in enumerate(dataloader):
 
-    #     host_name = socket.gethostname()
-    #     timestamp = datetime.now().strftime(TIME_FORMAT_STR)
-    #     file_prefix = f"{host_name}_{timestamp}"
-    #     # Construct the trace file.
-    #     prof.export_chrome_trace(f"{file_prefix}.json")
+        global_step += 1
+        local_step += 1
+        
+        if update_step > args.num_training_steps:
+            logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
+            print(f"Rank {global_rank} stopping training.")
+            break
+        
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch["input_ids"].clone()
+        labels[labels == pad_idx] = -100
+        tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
 
-    #     # Construct the memory timeline file.
-    #     print("Device", device)
-    #     prof.export_memory_timeline(f"{file_prefix}.html", device=device)
-    
+        loss = model(**batch, labels=labels).loss
+        scaled_loss = loss / args.gradient_accumulation
+        scaled_loss.backward()
 
-    with conditional_with(args.monitor_memory, profiler):
-    # with torch.profiler.profile(
-    #     activities=[
-    #         torch.profiler.ProfilerActivity.CPU,
-    #         torch.profiler.ProfilerActivity.CUDA,
-    #     ],
-    #     # schedule=torch.profiler.schedule(wait=0, warmup=0, active=6, repeat=1),
-    #     record_shapes=True,
-    #     profile_memory=True,
-    #     with_stack=True,
-    #     on_trace_ready=trace_handler,
-    #     use_cuda=True
-    # ) as prof:
+        if global_step % args.gradient_accumulation != 0:
+            continue
 
-        for batch_idx, batch in enumerate(dataloader):
-            # prof.step()
+        if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
-            global_step += 1
-            local_step += 1
+        if global_rank == 0: pbar.update(1)
+        if update_step == 50:
             
-            if update_step > args.num_training_steps:
-                logger.info(f"Reached max number of update steps (f{args.num_training_steps}). Stopping training.")
-                print(f"Rank {global_rank} stopping training.")
-
-                import socket
-                TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
-
-                host_name = socket.gethostname()
-                timestamp = datetime.now().strftime(TIME_FORMAT_STR)
-                file_prefix = f"{host_name}_{timestamp}"
-
-                # torch.cuda.memory._record_memory_history(enabled=None)
-                # Disable the profiling.
-                # prof.stop()
-
-                # # Construct the memory timeline file.
-                # print("Device", device)
-                # prof.export_memory_timeline(f"{file_prefix}.html", device=device)
+            # Get the optimizer memory usage
+            optimizer_memory_usage, _ = calculate_optimizer_memory_usage(optimizer)
+            full_optimizer_memory_usage = optimizer_memory_usage
+            full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
             
-                break
-            
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["input_ids"].clone()
-            labels[labels == pad_idx] = -100
-            tokens_seen += (batch["input_ids"] != pad_idx).sum().item() * world_size
+            print("\n")
+            logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
 
-            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## forward ##")):
-            # with record_function("## forward ##"):
-            loss = model(**batch, labels=labels).loss
-            scaled_loss = loss / args.gradient_accumulation
-            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## backward ##")):
-            # with record_function("## backward ##"):
-            scaled_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        scheduler.step()
 
-            if global_step % args.gradient_accumulation != 0:
-                continue
+        update_step += 1
+        update_time = time.time() - update_time
 
-            if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
-            if global_rank == 0: pbar.update(1)
-            if update_step == 50:
+
+        
+        if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
+            current_model_directory = f"{args.save_dir}/model_{update_step}"
+            logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
+            os.makedirs(args.save_dir, exist_ok=True)
+
+            # Check if DistributedDataParallel is used
+            if args.single_gpu:
+                model.save_pretrained(current_model_directory, max_shard_size='100GB')
+            else:
+                model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
+
+            optimizer_checkpoint = {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "update_step": update_step,
+                "global_step": global_step,
+                "config": run_config,
+                "wandb": wandb.run.dir,
+                "dtype": args.dtype,
+            }
+            torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
+
+            training_state_checkpoint = {
+                "global_step": global_step,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
+                "tokens_seen_before": tokens_seen_before,
+                "update_time": update_time,
+            }
+            with open(f"{current_model_directory}/training_state.json", "w") as f:
+                json.dump(training_state_checkpoint, f, indent=4)
                 
-                # Get the optimizer memory usage
-                optimizer_memory_usage, optimizer_tt_memory_usage = calculate_optimizer_memory_usage(optimizer)
-                full_optimizer_memory_usage = optimizer_memory_usage + optimizer_tt_memory_usage
-                full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
-                
-                # print new line 
-                print("\n")
-                logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
-                logger.info(f"  -> tensor-train : {optimizer_tt_memory_usage / (1024 * 1024):.2f} MiB")
-                logger.info(f"  -> standard : {optimizer_memory_usage / (1024 * 1024):.2f} MiB")
+            # save wandb related info
+            wandb_info = {
+                "wandb_id": wandb.run.id,
+            }
+            with open(f"{args.save_dir}/wandb.json", "w") as f:
+                json.dump(wandb_info, f, indent=4)
 
-            # with conditional_with(args.monitor_memory, torch.autograd.profiler.record_function("## optimizer ##")):
-            # with record_function("## optimizer ##"):
-            optimizer.step()
-            optimizer.zero_grad()
-            # torch.autograd.set_detect_anomaly(True)
-            scheduler.step()
-
-            update_step += 1
-            update_time = time.time() - update_time
-
-
-
-            
-            if local_step > args.gradient_accumulation and update_step % args.save_every == 0 and global_rank == 0:
-                current_model_directory = f"{args.save_dir}/model_{update_step}"
-                logger.info(f"Saving model and optimizer to {current_model_directory}, update step {update_step}")
-                os.makedirs(args.save_dir, exist_ok=True)
-
-                # Check if DistributedDataParallel is used
-                if args.single_gpu:
-                    model.save_pretrained(current_model_directory, max_shard_size='100GB')
-                else:
-                    model.module.save_pretrained(current_model_directory, max_shard_size='100GB')
-
-                optimizer_checkpoint = {
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "update_step": update_step,
-                    "global_step": global_step,
-                    "config": run_config,
-                    "wandb": wandb.run.dir,
-                    "dtype": args.dtype,
-                }
-                torch.save(optimizer_checkpoint, f"{current_model_directory}/optimizer.pt")
-
-                training_state_checkpoint = {
-                    "global_step": global_step,
-                    "update_step": update_step,
-                    "tokens_seen": tokens_seen,
-                    "tokens_seen_before": tokens_seen_before,
-                    "update_time": update_time,
-                }
-                with open(f"{current_model_directory}/training_state.json", "w") as f:
-                    json.dump(training_state_checkpoint, f, indent=4)
-                    
-                # save wandb related info
-                wandb_info = {
-                    "wandb_id": wandb.run.id,
-                }
-                with open(f"{args.save_dir}/wandb.json", "w") as f:
-                    json.dump(wandb_info, f, indent=4)
-
-            if update_step % args.eval_every == 0:
-                logger.info(f"Performing evaluation at step {update_step}")
-                total_loss, evaluated_on_tokens = evaluate_model(
-                    model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
-                )
-                if global_rank == 0:
-                    wandb.log({
-                        "final_eval_loss": total_loss,
-                        "final_eval_tokens": evaluated_on_tokens,
-                        },
-                        step=global_step,
-                    )
-                logger.info(f"Eval loss at step {update_step}: {total_loss}")
-
-            lr = optimizer.param_groups[0]["lr"]
-            
-            tokens_in_update = tokens_seen - tokens_seen_before
-            tokens_seen_before = tokens_seen
-
+        if update_step % args.eval_every == 0:
+            logger.info(f"Performing evaluation at step {update_step}")
+            total_loss, evaluated_on_tokens = evaluate_model(
+                model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+            )
             if global_rank == 0:
                 wandb.log({
-                    "loss": loss.item(),
-                    "lr": lr,
-                    "update_step": update_step,
-                    "tokens_seen": tokens_seen,
-                    "throughput_tokens": tokens_in_update / update_time,
-                    "throughput_examples": args.total_batch_size / update_time,
+                    "final_eval_loss": total_loss,
+                    "final_eval_tokens": evaluated_on_tokens,
                     },
                     step=global_step,
                 )
-            update_time = time.time()
+            logger.info(f"Eval loss at step {update_step}: {total_loss}")
+
+        lr = optimizer.param_groups[0]["lr"]
+        if len(optimizer.param_groups) > 1:
+            sow_lr = optimizer.param_groups[1]["lr"]
+        else:
+            sow_lr = None
+        
+        tokens_in_update = tokens_seen - tokens_seen_before
+        tokens_seen_before = tokens_seen
+
+        if global_rank == 0:
+            wandb.log({
+                "loss": loss.item(),
+                "lr": lr,
+                "sow_lr": sow_lr,
+                "update_step": update_step,
+                "tokens_seen": tokens_seen,
+                "throughput_tokens": tokens_in_update / update_time,
+                "throughput_examples": args.total_batch_size / update_time,
+                },
+                step=global_step,
+            )
+        update_time = time.time()
 
 def cleanup(profiler, name):
     logger.info("Cleaning up")
@@ -574,10 +536,7 @@ def cleanup(profiler, name):
             logger.error(f"Failed to capture memory snapshot {e}")
 
         # Stop recording memory snapshot history.
-
         logger.info("Stopping memory profiling")
-        # profiler.export_memory_timeline(f"memory.html", row_limit=100_000)
-        # logger.info("Memory timeline exported to memory.html")
         
         torch.cuda.memory._record_memory_history(enabled=None)
 
@@ -678,6 +637,44 @@ def check_args_torchrun_main(args):
 
 
 
+def get_all_schedulers(
+    optimizer,
+    *,
+    scheduler_type,
+    num_training_steps,
+    warmup_steps,
+    min_lr_ratio,
+    cycle_length=None,
+    restart_warmup_steps=None,
+    adjust_step=0,
+    last_epoch=-1,
+    cycle_ratio=1.0,
+):
+    if not isinstance(num_training_steps, tuple):
+        num_training_steps = (num_training_steps,)
+        cycle_length = (cycle_length,)
+        cycle_ratio = (cycle_ratio,)
+
+    lambda_schedulers = []
+    for i in range(len(num_training_steps)):
+        scheduler = get_scheculer(
+            optimizer,
+            scheduler_type=scheduler_type,
+            num_training_steps=num_training_steps[i],
+            warmup_steps=warmup_steps,
+            min_lr_ratio=min_lr_ratio,
+            cycle_length=cycle_length[i],
+            restart_warmup_steps=restart_warmup_steps,
+            adjust_step=adjust_step,
+            last_epoch=last_epoch,
+            cycle_ratio=cycle_ratio[i],
+            param_group_indices=[i],
+        )
+        lambda_schedulers.append(scheduler)
+    
+    if len(lambda_schedulers) == 1:
+        lambda_schedulers = lambda_schedulers[0]
+    return LambdaLR(optimizer, lambda_schedulers, last_epoch)
 
 
 def get_scheculer(
@@ -691,11 +688,16 @@ def get_scheculer(
     restart_warmup_steps=None,
     adjust_step=0,
     last_epoch=-1,
+    cycle_ratio=1.0,
+    param_group_indices=None,
 ):
     if adjust_step != 0 and scheduler_type != "cosine_restarts":
         raise ValueError("adjust_step is only supported for cosine_restarts scheduler")
 
+    warmup_steps = int(warmup_steps * num_training_steps)
+
     if scheduler_type == "linear":
+        # NO GROUP INDICES!
         return transformers.get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
@@ -710,6 +712,8 @@ def get_scheculer(
             cycle_length=cycle_length,
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
+            cycle_ratio=cycle_ratio,
+            param_group_indices=param_group_indices,
         )
     if scheduler_type == "cosine_restarts":
         assert restart_warmup_steps is not None, "restart_warmup_steps must be specified for cosine_restarts scheduler"
@@ -722,12 +726,14 @@ def get_scheculer(
             min_lr_ratio=min_lr_ratio,
             last_epoch=last_epoch,
             adjust_step=adjust_step,
+            cycle_ratio=cycle_ratio,
+            param_group_indices=param_group_indices,
         )
 
     raise NotImplementedError(f"Scheduler {scheduler_type} is not implemented")
 
 
-def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1):
+def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_training_steps, cycle_length, min_lr_ratio=0.1, last_epoch=-1, cycle_ratio=1.0, param_group_indices=None):
     assert cycle_length is not None or num_training_steps is not None, "You must specify either cycle_length or num_training_steps"
     
     if cycle_length is None:
@@ -741,8 +747,9 @@ def get_cyclical_cosine_schedule_with_min_lr(optimizer, num_warmup_steps, num_tr
         num_warmup_steps=num_warmup_steps,
         cycle_length=cycle_length,
         min_lr_ratio=min_lr_ratio,
+        cycle_ratio=cycle_ratio
     )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
+    return lr_lambda
 
 
 def get_cosine_schedule_with_multiple_warmups(
@@ -771,8 +778,7 @@ def get_cosine_schedule_with_multiple_warmups(
         min_lr_ratio=min_lr_ratio,
         adjust_step=adjust_step,
     )
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
-
+    return lr_lambda
 
 @torch.no_grad()
 def random_pruning(tensor, prune_ratio):
@@ -799,22 +805,23 @@ def magnitude_pruning(tensor, prune_ratio):
     return tensor
 
 
-def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio):
+def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio, cycle_ratio=1.0):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
 
     # compute where we are in the current cycle
     cycle_step = current_step % cycle_length
+    cycle_number = current_step // cycle_length
 
     if cycle_step < num_warmup_steps:
         if current_step != cycle_step:
             if cycle_step < 2:
                 return 1e-7
-        return float(cycle_step) / float(max(1, num_warmup_steps))
+        return float(cycle_step) / float(max(1, num_warmup_steps)) * (cycle_ratio ** cycle_number)
 
-    progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps))
+    progress = float(cycle_step - num_warmup_steps) / float(max(1, cycle_length - num_warmup_steps)) 
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+    return (min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay) * (cycle_ratio ** cycle_number)
 
 
 def _get_cosine_schedule_with_multiple_warmups_lambda(
@@ -863,7 +870,6 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
 
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
-
 
 def collate_fn(batch_list):
     batch = {
@@ -947,12 +953,12 @@ def modify_model(model, args, device):
                     type=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
                 )
             elif args.architecture == "sow":
-                new_layer = SumLinear(
+                new_layer = SoWLinear(
                     in_features=layer.in_features,
                     out_features=layer.out_features,
                     rank=args.rank,
                     n_iter=args.n_iter,
-                    accumulation_steps=args.sow_acc_steps,
+                    accumulation_steps=args.sow_accumulation,
                     device=device,
                     bias=layer.bias is not None,
                     dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
@@ -969,7 +975,6 @@ def modify_model(model, args, device):
                     bias=False,
                     dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
                 )
-
 
             model.model.layers[i].__getattr__(module).__setattr__(attr, new_layer)
 

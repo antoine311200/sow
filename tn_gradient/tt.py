@@ -284,8 +284,9 @@ class TensorTrain:
         # Then, compute the number of bits to shift the tensor train to the right
         # This allows the square root algorithm to converge
         max_value = float(max([core.abs().max() for core in self.cores]))
+        max_value = torch.prod(torch.tensor(self.ranks)) * (max_value ** (self.order // 2))
         k = floor(log(max_value) / log(4))
-        c, revc = (1/(4**k)), (1/2**(k-1))
+        c, revc = (1/(4**k)), 2**k
 
         # Scale the tensor train by 1/4^k
         A = c * self.clone()
@@ -308,7 +309,7 @@ class TensorTrain:
         A = revc * A
         return A
 
-    def sqrt(self, threshold=1e-3):
+    def sqrt(self, threshold=1e-3, max_iter=4):
         """Compute the element-wise square root of the tensor train
         using an iterative method.
         This is a SLOW method and should be used with caution.
@@ -319,6 +320,7 @@ class TensorTrain:
         # This allows the square root algorithm to converge
         # max_value = float(max([core.abs().max() for core in self.cores]))
         max_value = float(self.cores[-1].abs().max())
+        max_value = torch.prod(torch.tensor(self.ranks)) * (max_value ** 1)
         k = floor(log(max_value) / log(4))
 
         # Scale the tensor train by 1/4^k
@@ -326,7 +328,6 @@ class TensorTrain:
         C = A.clone().add_(-1)
 
         ranks = A.ranks.copy()
-        max_iter = 10
         while max_iter > 0 and (A - C).norm() > threshold:
             B = A - 1/2 * (A * C)
             B = B.round(ranks)

@@ -55,7 +55,7 @@ class TTAdam(torch.optim.Optimizer):
                 if "step" not in state:
                     state["step"] = 0
 
-                if "ranks" in group and True:
+                if "ranks" in group and False:
                     if state["step"] % 200 == 0:
                         data = grad.data.float()
                         Q, _ = torch.linalg.qr(data)
@@ -102,7 +102,7 @@ class TTAdam(torch.optim.Optimizer):
                 # compute norm gradient
                 norm_grad = m / denom
 
-                if "ranks" in group and True:
+                if "ranks" in group and False:
                     norm_grad = torch.matmul(state["projector"], norm_grad)
 
                 p.add_(norm_grad, alpha=-step_size)

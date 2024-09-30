@@ -52,8 +52,8 @@ from tn_gradient.optimizer.ttsgd import TTSGD
 from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
 from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sumlinear import SumLinear, SumTTLinear
-
+from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
+from tn_gradient.prepare import prepare_sow
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.38.0.dev0")
 
@@ -222,6 +222,7 @@ def parse_args():
     parser.add_argument("--enable_sow", action="store_true")
     parser.add_argument("--rank", type=int, default=10)
     parser.add_argument("--n_iter", type=int, default=5)
+    parser.add_argument("--accumulation_steps", type=int, default=200)
     # lora_all_modules
     # parser.add_argument("--lora_all_modules", action="store_true", help="Whether or not to use lora for all modules.")
     # eval_llama
@@ -371,7 +372,16 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
         if args.enable_sow:
-            model = modify_model(model, args, device)
+            sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, accumulation_steps=args.accumulation_steps)
+
+            if "llama" in args.model_name_or_path:
+                target_modules = [
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"
+                ]
+            elif "roberta" in args.model_name_or_path:
+                target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
+            model = prepare_sow(model, target_modules, sow_args)
             print(model)
     else:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
@@ -649,6 +659,7 @@ def main():
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"***** Epoch {epoch} *****")
         logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num trainable parameters = {trainable_params}")
         if args.with_tracking:
             total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
@@ -656,6 +667,11 @@ def main():
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
+
+        # print(model.roberta.encoder.layer[5].intermediate.dense.accumulated_weight)
+        # print(model.roberta.encoder.layer[5].intermediate.dense.downscale_weights[0])
+        # print(model.roberta.encoder.layer[5].intermediate.dense.upscale_weights[0])
+
         for step, batch in enumerate(active_dataloader):
 
             outputs = model(**batch)
@@ -771,81 +787,6 @@ def main():
         all_results = {f"eval_{k}": v for k, v in eval_metric.items()}
         with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
             json.dump(all_results, f)
-
-def modify_model(model, args, device):
-    print(model)
-    # Check if model name is a roberta model
-    if "roberta" in args.model_name_or_path:
-        layers = model.roberta.encoder.layer
-        linear_layers = [
-            ("attention", "self", "query"),
-            ("attention", "self", "key"),
-            ("attention", "self", "value"),
-            ("attention", "output", "dense"),
-            ("intermediate", "dense"),
-        ]
-    else:
-        layers = model.layers
-        linear_layers = [
-            ("self_attn", "q_proj"),
-            ("self_attn", "k_proj"),
-            ("self_attn", "v_proj"),
-            ("self_attn", "o_proj"),
-            ("mlp", "gate_proj"),
-            ("mlp", "up_proj"),
-            ("mlp", "down_proj"),
-        ]
-    for i in range(len(layers)):
-        for path in linear_layers:
-            layer = layers[i]
-            _path = deepcopy(path)
-            while len(_path):
-                layer = layer.__getattr__(_path[0])
-                _path = _path[1:]
-            
-            convertion = False
-            if layer.weight.data.dtype != torch.float:
-                convertion = True
-
-                weight_type = layer.weight.data.dtype
-                weight_device = layer.weight.data.device
-                layer.weight = layer.weight.to(torch.float)
-
-            Q, R = torch.linalg.qr(layer.weight.data)
-            Q = Q[:, :args.n_iter*args.rank]
-            R = R[:args.n_iter*args.rank, :]
-            A, B = torch.split(Q, args.rank, dim=1), torch.split(R, args.rank, dim=0)
-            
-            new_layer = SumLinear(
-                in_features=layer.in_features,
-                out_features=layer.out_features,
-                rank=args.rank,
-                device=device,
-                bias=layer.bias is not None,
-                n_iter=args.n_iter,
-                dtype=layer.weight.data.dtype#torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
-            )
-            new_layer.downscale_weights.from_weights(A)
-            new_layer.upscale_weights.from_weights(B)
-            if layer.bias is not None:
-                new_layer.bias = layer.bias
-            # Set gradient
-            new_layer.downscale_weights.requires_grad = layer.weight.requires_grad
-            new_layer.upscale_weights.requires_grad = layer.weight.requires_grad
-
-            if convertion:
-                new_layer.downscale_weights.to(weight_device).type(weight_type)
-                new_layer.upscale_weights.to(weight_device).type(weight_type)
-
-            layer = layers[i]
-            _path = deepcopy(path)
-            while len(_path) > 1:
-                layer = layer.__getattr__(_path[0])
-                _path = _path[1:]
-            layer.__setattr__(_path[0], new_layer)
-            # layers[i].__getattr__(module).__setattr__(attr, new_layer)
-
-    return model
 
 if __name__ == "__main__":
     main()
