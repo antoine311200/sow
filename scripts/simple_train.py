@@ -85,6 +85,7 @@ def parse_args(args):
     parser.add_argument("--rank", type=int, default="4")
     parser.add_argument("--n_iter", type=int, default="4")
     parser.add_argument("--lr_decay", type=float, default="1.0")
+    parser.add_argument("--reset_scheduler", default=False, action="store_true")
 
     # Galore parameters
     parser.add_argument("--galore_rank", type=int, default="128")
@@ -240,8 +241,12 @@ def main(args):
     special_params = []
     if args.architecture == "sow":
         sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_accumulation)
+        print(sow_args)
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+        logger.info("Preparing SoW model")
         model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
+        logger.info("SoW model prepared")
 
         for module_name, module in model.named_modules():
             if not isinstance(module, SoWLinear):
@@ -303,46 +308,25 @@ def main(args):
         wandb.config.update(run_config, allow_val_change=True)
         wandb.save(os.path.abspath(__file__), policy="now")
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
-    
 
-    # if "TT".lower() in args.optimizer.lower() or "galore" in args.optimizer.lower():
-    #     tt_params = []
-    #     target_modules_list = ["attn", "mlp", "dense", "attention", "self_attn"]
-    #     for module_name, module in model.named_modules():
-    #         if not isinstance(module, nn.Linear):
-    #             continue
-
-    #         if not any(target_key in module_name for target_key in target_modules_list):
-    #             continue
-            
-    #         print('enable Tensor Train for for weights in module: ', module_name, 'with shape: ', list(module.weight.shape))
-    #         tt_params.append(module.weight)
-    #     id_tt_params = [id(p) for p in tt_params]
-    #     regular_params = [p for p in trainable_params if id(p) not in id_tt_params]
-        
-    #     if "tt" in args.optimizer.lower():
-    #         param_groups = [
-    #             {"params": regular_params},
-    #             {"params": tt_params, "ranks": [1] + [int(args.rank)] * (int(args.order) - 1) + [1]},
-    #         ]
-    #     else:
-    #         param_groups = [
-    #             {"params": regular_params},
-    #             {"params": tt_params,
-    #              'rank': 128,
-    #              'update_proj_gap': 200,
-    #              'scale': 0.25,
-    #              'proj_type': "std"
-    #             }
-    #         ]
+    memory_usage, memory_usage_sow, memory_usage_accum = calculate_weight_usage(model)
+    memory_train_usage = sum(p.nelement() * p.element_size() for p in model.parameters() if p.requires_grad)
 
     logger.info(f"\n{model}\n")
-    logger.info(f"Total params: {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
-    logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
+    logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
+    logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
+    logger.info(f"Trainable params: {memory_train_usage / (1024 * 1024):.2f}MiB")
     if args.architecture == "sow":
-        logger.info(f"SoW params: {sum(p.numel() for p in special_params) / 1_000_000:.2f}M")
+        logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
 
-    logger.info(f"Model memory usage: {calculate_model_memory_usage(model) / (1024 * 1024):.2f} MiB")
+
+    # logger.info(f"Total params (start): {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
+    # logger.info(f"Total params (end): {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
+    # logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
+    # if args.architecture == "sow":
+    #     logger.info(f"SoW params: {sum(p.numel() for p in special_params) / 1_000_000:.2f}M")
+
+    # logger.info(f"Model memory usage: {calculate_model_memory_usage(model) / (1024 * 1024):.2f} MiB")
 
     if args.optimizer.lower() == "SGD".lower():
         optimizer = TTSGD(
@@ -375,15 +359,26 @@ def main(args):
     else:
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
+
+
+    if args.architecture == "sow" and args.reset_scheduler:
+        num_training_steps = (args.num_training_steps, args.sow_accumulation)
+        cycle_length = (None, args.sow_accumulation)
+        cycle_ratio = (1.0, args.lr_decay)
+    else:
+        num_training_steps = args.num_training_steps
+        cycle_length = None
+        cycle_ratio = 1.0
+    
     scheduler = get_all_schedulers(
         optimizer=optimizer,
         scheduler_type=args.scheduler,
-        num_training_steps=args.num_training_steps if args.architecture != "sow" else (args.num_training_steps, args.sow_accumulation),
+        num_training_steps=num_training_steps,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
-        cycle_length=None if args.architecture != "sow" else (None, args.sow_accumulation),
         restart_warmup_steps=args.warmup_steps,
-        cycle_ratio=1.0 if args.architecture != "sow" else (1.0, args.lr_decay),
+        cycle_length=cycle_length,
+        cycle_ratio=cycle_ratio,
     )
 
     if not args.single_gpu:
@@ -651,9 +646,9 @@ def get_all_schedulers(
     cycle_ratio=1.0,
 ):
     if not isinstance(num_training_steps, tuple):
-        num_training_steps = (num_training_steps,)
-        cycle_length = (cycle_length,)
-        cycle_ratio = (cycle_ratio,)
+        num_training_steps = (num_training_steps, ) * len(optimizer.param_groups)
+        cycle_length = (cycle_length,) * len(optimizer.param_groups)
+        cycle_ratio = (cycle_ratio,) * len(optimizer.param_groups)
 
     lambda_schedulers = []
     for i in range(len(num_training_steps)):
@@ -925,60 +920,25 @@ def calculate_batch_memory_usage(batch, labels):
     memory_usage += labels.nelement() * labels.element_size()
     return memory_usage
 
-def modify_model(model, args, device):
-    layers = [
-        ("self_attn", "q_proj"),
-        ("self_attn", "k_proj"),
-        ("self_attn", "v_proj"),
-        ("self_attn", "o_proj"),
-        ("mlp", "gate_proj"),
-        ("mlp", "up_proj"),
-        ("mlp", "down_proj"),
-    ]
+def calculate_weight_usage(model):
+    memory_usage_sow = 0
+    memory_usage_accum = 0
+    memory_usage = sum(p.numel() for p in model.parameters())
+    
+    for param in model.parameters():
+        if isinstance(param, torch.Tensor):
+            memory_usage += param.nelement() * param.element_size()
 
-    if args.architecture == "linear":
-        return model
-
-    for i in range(len(model.model.layers)):
-        for module, attr in layers:
-            layer = model.model.layers[i].__getattr__(module).__getattr__(attr)
+    for _, module in model.named_modules():
+        if isinstance(module, SoWLinear):
+            for weight in module.upscale_weights:
+                memory_usage_sow += weight.nelement() * weight.element_size()
+            for weight in module.downscale_weights:
+                memory_usage_sow += weight.nelement() * weight.element_size()
             
-            if args.architecture == "ttlinear":
-                new_layer = TensorTrainLinear(
-                    in_features=layer.in_features,
-                    out_features=layer.out_features,
-                    ranks=[1] + [args.rank] * (args.order - 1) + [1],
-                    device=device,
-                    bias=False,
-                    type=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
-                )
-            elif args.architecture == "sow":
-                new_layer = SoWLinear(
-                    in_features=layer.in_features,
-                    out_features=layer.out_features,
-                    rank=args.rank,
-                    n_iter=args.n_iter,
-                    accumulation_steps=args.sow_accumulation,
-                    device=device,
-                    bias=layer.bias is not None,
-                    dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
-                )
-            elif args.architecture == "sttlinear":
-                new_layer = SumTTLinear(
-                    in_features=layer.in_features,
-                    out_features=layer.out_features,
-                    order=args.order,
-                    n_iter=args.n_iter,
-                    inner_rank=args.inner_rank,
-                    outer_rank=args.rank,
-                    device=device,
-                    bias=False,
-                    dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else torch.float32,
-                )
-
-            model.model.layers[i].__getattr__(module).__setattr__(attr, new_layer)
-
-    return model
+            memory_usage_accum += module.in_features * module.out_features
+    
+    return memory_usage, memory_usage_sow, memory_usage_accum
 
 if __name__ == "__main__":
     print("Starting script")
