@@ -70,10 +70,13 @@ class SoWLinear(nn.Module):
         self.n_iter = n_iter
         self.rank = rank
         self.step = 0
+        self.virtual_rank = min(rank * n_iter, in_features, out_features)
         self.buffer_proj = buffer_proj
 
-        self.accumulate_every = accumulation_steps 
-        self.accumulated_weight = None
+        self.accumulate_every = 2 * accumulation_steps # Account for the forward and backward pass
+        # self.accumulated_weight = None
+        self.acc_upweight = None
+        self.acc_downweight = None
 
         self.init_method = init_method
 
@@ -121,10 +124,11 @@ class SoWLinear(nn.Module):
         if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
             self.accumulate()
 
-        if self.accumulated_weight is not None:
-            out = x @ self.accumulated_weight
-        else:
-            out = None
+        out = None
+        if self.acc_downweight is not None and self.acc_upweight is not None:
+            out = (x @ self.acc_downweight) @ self.acc_upweight
+        elif self.acc_downweight is not None and self.acc_upweight is None:
+            out = x @ self.acc_downweight
 
         for downscale_weight, upscale_weight in zip(
             self.downscale_weights, self.upscale_weights
@@ -142,20 +146,51 @@ class SoWLinear(nn.Module):
         return out
     
     def accumulate(self):
-        accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()#.cpu().numpy()
 
-        if self.accumulated_weight is None:
-            self.accumulated_weight = accumalation
+        # Accumulate the weights
+        accumalation = torch.sum(torch.stack([
+            a.detach() @ b.detach() 
+            for a, b in zip(self.downscale_weights, self.upscale_weights)
+        ]), dim=0).detach()
+
+        # Compute the full W_acc matrix from the previous accumulated weights
+        if self.acc_downweight is not None and self.acc_upweight is not None:
+            accumalation = accumalation.to(self.acc_upweight.device) + self.acc_downweight @ self.acc_upweight
+        elif self.acc_downweight is not None and self.acc_upweight is None:
+            accumalation = accumalation.to(self.acc_downweight.device) + self.acc_downweight
+
+        # Perform QR decomposition to get the new accumulated weights
+        # only if the virtual rank is less than the full-rankness
+        if self.virtual_rank < min(self.in_features, self.out_features):
+            # Convertion to float is necessary for the QR decomposition
+            # as CUDA does not support QR decomposition for half precision
+            convertion = False
+            if accumalation.dtype != torch.float:
+                convertion = True
+
+                weight_type = accumalation.dtype
+                weight_device = accumalation.device
+                accumalation = accumalation.to(torch.float)
+
+            Q, R = torch.linalg.qr(accumalation)
+            Q = Q[:, :self.virtual_rank]
+            R = R[:self.virtual_rank, :]
+
+            self.acc_downweight, self.acc_upweight = Q, R
+            self.acc_downweight.requires_grad = False
+            self.acc_upweight.requires_grad = False
+            
+            if convertion:
+                self.acc_downweight = self.acc_downweight.to(weight_device).type(weight_type)
+                self.acc_upweight = self.acc_upweight.to(weight_device).type(weight_type)
+
+            self.virtual_rank = min(self.virtual_rank + self.rank * self.n_iter, self.in_features, self.out_features)
+            torch.cuda.empty_cache()
         else:
-            self.accumulated_weight = self.accumulated_weight.to(accumalation.device) + accumalation
-
-        self.accumulated_weight = self.accumulated_weight.detach().to(self.downscale_weights[0].device)
-        self.accumulated_weight.requires_grad = False
-
-        if self.buffer_proj:
-            W = self.accumulated_weight
-            self.proj_row = torch.eye(W.size(1), device=W.device) - W.t() @ torch.inverse(W @ W.t()) @ W
-            self.proj_col = torch.eye(W.size(0), device=W.device) - W @ torch.inverse(W.t() @ W) @ W.t()
+            self.acc_downweight = accumalation
+            self.acc_downweight.requires_grad = False
+            self.acc_upweight = None
+            torch.cuda.empty_cache()
 
         # Reset weights
         new_downscale_weights = [torch.zeros_like(x) for x in self.downscale_weights]
@@ -169,10 +204,6 @@ class SoWLinear(nn.Module):
 
         self.downscale_weights.from_weights(new_downscale_weights)
         self.upscale_weights.from_weights(new_upscale_weights)
-        
-        if self.init_method == "kaiming_kaiming":
-            random_accumalation = torch.sum(torch.stack([a.detach() @ b.detach() for a, b in zip(self.downscale_weights, self.upscale_weights)]), dim=0).detach()
-            self.accumulated_weight = self.accumulated_weight - random_accumalation
 
     def project_grad(self):
         """Use the buffered projector onto the orthogonal complement of the accumulated weight
