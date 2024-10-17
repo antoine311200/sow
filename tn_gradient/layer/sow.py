@@ -57,9 +57,7 @@ class SoWLinear(nn.Module):
         bias: bool = True,
         rank: int = 16,
         n_iter: int = 5,
-        accumulation_steps: int = 200,
         init_method: str = "zero_kaiming",
-        buffer_proj: bool = False,
         device=None,
         dtype=None,
     ) -> None:
@@ -71,10 +69,7 @@ class SoWLinear(nn.Module):
         self.rank = rank
         self.step = 0
         self.virtual_rank = min(rank * n_iter, in_features, out_features)
-        self.buffer_proj = buffer_proj
 
-        self.accumulate_every = 2 * accumulation_steps # Account for the forward and backward pass
-        # self.accumulated_weight = None
         self.acc_upweight = None
         self.acc_downweight = None
 
@@ -92,10 +87,6 @@ class SoWLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        if self.buffer_proj:
-            self.register_buffer("proj_row", torch.eye(self.out_features))
-            self.register_buffer("proj_col", torch.eye(self.in_features))
-
         self.reset_parameters()
 
         # Add a hook to step the model at each backward pass
@@ -110,6 +101,7 @@ class SoWLinear(nn.Module):
             zip(self.downscale_weights, self.upscale_weights)
         ):
             if i / self.n_iter >= 1 - reset_scale:
+                # nn.init.zeros_(downscale_weight)
                 nn.init.kaiming_uniform_(downscale_weight, a=sqrt(5))
                 nn.init.kaiming_uniform_(upscale_weight, a=sqrt(5))
 
@@ -121,8 +113,8 @@ class SoWLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
-            self.accumulate()
+        # if self.training and self.step % self.accumulate_every == 0 and self.step > 0:
+        #     self.accumulate()
 
         out = None
         if self.acc_downweight is not None and self.acc_upweight is not None:

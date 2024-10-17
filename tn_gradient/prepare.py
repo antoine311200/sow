@@ -66,7 +66,6 @@ def prepare_sow(
         new_layer = SoWLinear(
             in_features=module.in_features,
             out_features=module.out_features,
-            accumulation_steps=args.accumulation_steps,
             rank=args.rank,
             n_iter=args.n_iter,
             bias=module.bias is not None,
@@ -110,3 +109,9 @@ def prepare_sow(
             setattr(model, name, new_layer)
 
     return model
+
+
+def accumulate(model):
+    for _, module in model.named_modules():
+        if isinstance(module, SoWLinear):
+            module.accumulate()
