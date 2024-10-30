@@ -1,0 +1,14 @@
+accelerate==0.34.2
+datasets==2.21.0
+evaluate==0.4.2
+galore_torch @ git+https://github.com/jiaweizzhao/GaLore/
+loguru==0.7.2
+matplotlib==3.9.2
+numpy==2.1.2
+opt_einsum==3.3.0
+safetensors==0.4.5
+scipy==1.14.1
+setuptools==69.5.1
+torch==2.4.0
+tqdm==4.66.5
+transformers==4.44.2
