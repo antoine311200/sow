@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import time
 import json
@@ -20,6 +21,7 @@ from torch.autograd.profiler import record_function
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from safetensors.torch import load_model
 
 import datasets
 import datasets.distributed
@@ -29,11 +31,11 @@ from tqdm import tqdm
 from loguru import logger
 
 from tn_gradient.optimizer.ttsgd import TTSGD
-from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
+# from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
-from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow
+# from tn_gradient.layer.tensor_linear import TensorTrainLinear
+from tn_gradient.layer.sow import SoWLinear, SoWArgs
+from tn_gradient.prepare import prepare_sow, accumulate
 
 from galore_torch import GaLoreAdamW
 
@@ -54,16 +56,20 @@ def parse_args(args):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--model_config", type=str, required=True)
+    parser.add_argument("--continue_from", type=str, default=None)
+    parser.add_argument("--wandb_id", type=str, default=None)
+    parser.add_argument("--wandb_off", default=False, action="store_true")
     parser.add_argument("--batch_size", type=int, required=True)
     parser.add_argument("--total_batch_size", type=int, default=None)
     parser.add_argument("--max_length", type=int, default=256)
-    parser.add_argument("--optimizer", default="TTSGD")
+    parser.add_argument("--optimizer", default="adam")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--scheduler", type=str, default="cosine", choices=["linear", "cosine", "cosine_restarts"])
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--nesterov", action="store_true")
     parser.add_argument("--warmup_steps", type=float, default=0.1)
+    parser.add_argument("--activation_checkpointing", action="store_true", default=False)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--logging_steps", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=1_000)
@@ -71,21 +77,26 @@ def parse_args(args):
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32")
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--name", type=str, default="test")
     parser.add_argument("--grad_clipping", type=float, default=0.0)
     parser.add_argument("--num_training_steps", type=int, default=1_000_000)
     parser.add_argument("--gradient_accumulation", type=int, default=None)
     parser.add_argument("--monitor_memory", type=bool, default=False)
+    parser.add_argument("--eval", default=False, action="store_true")
 
     # Sum Of (LO) Weight parameters
     parser.add_argument("--architecture", type=str, default="linear")
     parser.add_argument("--sow_accumulation", type=int, default=200)
     parser.add_argument("--sow_lr", type=float, default=0.0015)
-    parser.add_argument("--rank", type=int, default="4")
-    parser.add_argument("--n_iter", type=int, default="4")
+    parser.add_argument("--sow_scale", type=float, default=1)
+    parser.add_argument("--init_method", type=str, default="normal_QR")
+    # parser.add_argument("--sow_init", type=str, default="qr_xe")
+    parser.add_argument("--rank", type=int, default=100)
+    parser.add_argument("--n_iter", type=int, default=1)
     parser.add_argument("--lr_decay", type=float, default="1.0")
     parser.add_argument("--reset_scheduler", default=False, action="store_true")
+    parser.add_argument("--accumulate_after_warmup", default=False, action="store_true")
 
     # Galore parameters
     parser.add_argument("--galore_rank", type=int, default="128")
@@ -114,7 +125,7 @@ def parse_args(args):
 @torch.no_grad()
 def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, device, batch_size):
     _time = time.time()
-    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True) #DGX
+    val_data = datasets.load_dataset("allenai/c4", "en", split="validation", streaming=True, save_infos=True) #DGX
     val_data = val_data.shuffle(seed=42)
     logger.info(f"Loaded validation dataset in {time.time() - _time:.2f} seconds")
 
@@ -128,7 +139,7 @@ def evaluate_model(model, preprocess_batched, pad_idx, global_rank, world_size, 
     )
     val_data_mapped.batch = lambda batch_size: batch_fn(val_data_mapped, batch_size)
 
-    target_eval_tokens = 1_000_000
+    target_eval_tokens = 5_000_000
     evaluated_on_tokens = 0
     total_loss = torch.tensor(0.0).to(device)
     total_batches = 1
@@ -200,7 +211,15 @@ def main(args):
         run_name = f"{args.model_config.split('/')[-1].rstrip('.json')}-{args.optimizer}-{args.architecture}-lr-{args.lr}"
 
     if global_rank != 0: logger.remove()
-    if global_rank == 0: wandb.init(project="sow-llama", name=run_name)
+    if global_rank == 0:
+        wandb.init(
+            project="sow-llama",
+            name=run_name,
+            mode="disabled" if args.wandb_off or args.eval else None
+            # id=None if not args.continue_from else args.wandb_id,
+            # resume=None if not args.continue_from else "must",
+            # resume_from=args.wandb_id+'?_step=40000'
+        )
     
     logger.info(f"Using dist with rank {global_rank} (only rank 0 will log)")
     logger.info("*" * 40)
@@ -237,16 +256,74 @@ def main(args):
 
     model_config = AutoConfig.from_pretrained(args.model_config)
     model = AutoModelForCausalLM.from_config(model_config)
+    
+    if args.architecture == "sow" or args.architecture == "lora":
+        sow_args = SoWArgs(
+            rank=args.rank,
+            n_iter=args.n_iter,
+            init_method=args.init_method,
+            scale=args.sow_scale,
+            dtype=args.dtype,
+            device=device,
+        )
 
-    special_params = []
-    if args.architecture == "sow":
-        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype, accumulation_steps=args.sow_accumulation)
-        print(sow_args)
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
         logger.info("Preparing SoW model")
         model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
         logger.info("SoW model prepared")
+
+        if args.architecture == "lora":
+            from math import sqrt
+            # Set accumulation step to be greater than the training steps
+            args.sow_accumulation = args.num_training_steps + 1
+            # Set accumulation matrix to be random and A to be zero
+            for _, module in model.named_modules():
+                if isinstance(module, SoWLinear):
+                    module.acc_downweight = torch.zeros(
+                        (module.in_features, module.out_features),
+                        dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else None,
+                        device=module.upscale_weights[0].device
+                    )
+                    nn.init.kaiming_uniform_(module.acc_downweight, a=sqrt(5))
+                    for i in range(0, module.n_iter):
+                        nn.init.zeros_(module.upscale_weights[i])
+    
+    local_step = 0 
+    global_step = 0
+    update_step = 0
+    tokens_seen = 0
+    tokens_seen_before = 0
+
+    if args.continue_from is not None:
+        logger.info("*" * 40)
+        logger.info(f"Loading model from {args.continue_from}")
+        # checkpoint_path = os.path.join(args.continue_from, "pytorch_model.bin")
+        checkpoint_path = os.path.join(args.continue_from, "model.safetensors")
+        # model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"), strict=True)
+        load_model(model, checkpoint_path)
+        logger.info(f"Model successfully loaded (strict=True policy)")
+        logger.info(model)
+
+        if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
+            logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
+            with open(os.path.join(args.continue_from, "training_state.json")) as f:
+                _old_state = json.load(f)
+            global_step = _old_state["global_step"]
+            update_step = _old_state["update_step"]
+            tokens_seen = _old_state["tokens_seen"]
+            tokens_seen_before = _old_state["tokens_seen_before"]
+            logger.info(f"global_step       : {global_step}")
+            logger.info(f"update_step       : {update_step}")
+            logger.info(f"tokens_seen       : {tokens_seen}")
+            logger.info(f"tokens_seen_before: {tokens_seen_before}")
+            logger.info(f"Will train for {args.num_training_steps - update_step} update steps")
+        else:
+            logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
+        logger.info("*" * 40)
+
+    special_params = []
+    if args.architecture == "sow" or args.architecture == "lora":
 
         for module_name, module in model.named_modules():
             if not isinstance(module, SoWLinear):
@@ -255,8 +332,6 @@ def main(args):
             if not any(target_key in module_name for target_key in target_modules):
                 continue
             
-            # print('enable SoW training for for weights in module: ', module_name, 'with shape: ', list(module.upscale_weights.shape), '+', list(module.downscale_weights.shape))
-
             for downscale_weight in module.downscale_weights:
                 special_params.append(downscale_weight)
             for upscale_weight in module.upscale_weights:
@@ -279,7 +354,9 @@ def main(args):
         trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
     else:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-
+    
+    if args.activation_checkpointing:
+        model.gradient_checkpointing_enable()
 
     if args.dtype in ["bf16", "bfloat16"]:
         model = model.to(device=device, dtype=torch.bfloat16)
@@ -298,11 +375,6 @@ def main(args):
         "device": str(device),
     })
 
-    local_step = 0 
-    global_step = 0
-    update_step = 0
-    tokens_seen = 0
-    tokens_seen_before = 0
 
     if global_rank == 0:
         wandb.config.update(run_config, allow_val_change=True)
@@ -319,14 +391,6 @@ def main(args):
     if args.architecture == "sow":
         logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
 
-
-    # logger.info(f"Total params (start): {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
-    # logger.info(f"Total params (end): {sum(p.numel() for p in model.parameters()) / 1_000_000:.2f}M")
-    # logger.info(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000:.2f}M")
-    # if args.architecture == "sow":
-    #     logger.info(f"SoW params: {sum(p.numel() for p in special_params) / 1_000_000:.2f}M")
-
-    # logger.info(f"Model memory usage: {calculate_model_memory_usage(model) / (1024 * 1024):.2f} MiB")
 
     if args.optimizer.lower() == "SGD".lower():
         optimizer = TTSGD(
@@ -360,10 +424,9 @@ def main(args):
         raise ValueError(f"Optimizer {args.optimizer} not supported")
 
 
-
     if args.architecture == "sow" and args.reset_scheduler:
-        num_training_steps = (args.num_training_steps, args.sow_accumulation)
-        cycle_length = (None, args.sow_accumulation)
+        num_training_steps = (args.num_training_steps, args.sow_accumulation * args.gradient_accumulation)
+        cycle_length = (None, args.sow_accumulation * args.gradient_accumulation)
         cycle_ratio = (1.0, args.lr_decay)
     else:
         num_training_steps = args.num_training_steps
@@ -379,7 +442,15 @@ def main(args):
         restart_warmup_steps=args.warmup_steps,
         cycle_length=cycle_length,
         cycle_ratio=cycle_ratio,
+        reset_after_warmup=args.accumulate_after_warmup
     )
+
+    if args.continue_from:
+        optimizer_path = os.path.join(args.continue_from, "optimizer.pt")
+        optimizer_checkpoint = torch.load(optimizer_path)
+
+        optimizer.load_state_dict(optimizer_checkpoint["optimizer"])
+        logger.info("Optimizer & Scheduler state dict loaded")
 
     if not args.single_gpu:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -391,6 +462,16 @@ def main(args):
 
     pad_idx = tokenizer.pad_token_id
     update_time = time.time()
+
+    if args.eval:
+        model.eval()
+        logger.info(f"Performing evaluation")
+        total_loss, evaluated_on_tokens = evaluate_model(
+            model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
+        )
+        logger.info(f"Eval loss : {total_loss}")
+
+        sys.exit()
 
     ############## Training loop ##############
 
@@ -419,6 +500,39 @@ def main(args):
         loss = model(**batch, labels=labels).loss
         scaled_loss = loss / args.gradient_accumulation
         scaled_loss.backward()
+
+        # Need to accumulate at steps offset + k*accumulation_step for all k
+        # Hence when update_step - offset if a multiple of accumulation_step
+
+        offset = (int(args.warmup_steps * args.num_training_steps) if args.accumulate_after_warmup else 0)
+        accumulation_step = int(args.gradient_accumulation * args.sow_accumulation)
+
+        if update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
+            # print("\n")
+            logger.info(f"Accumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
+            accumulate(model)
+
+            #  and args.reset_scheduler:
+
+            # Clear the optimizer states of the second param groups
+            group = optimizer.param_groups[1]
+            for param in group["params"]:
+                state = optimizer.state[param]
+                # Exponential moving average of gradient values
+                state["exp_avg"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                # Exponential moving average of squared gradient values
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                if group["amsgrad"]:
+                    # Maintains max of all exp. moving avg. of sq. grad. values
+                    state["max_exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+
+                state["step"] = torch.zeros_like(state["step"])
 
         if global_step % args.gradient_accumulation != 0:
             continue
@@ -644,6 +758,7 @@ def get_all_schedulers(
     adjust_step=0,
     last_epoch=-1,
     cycle_ratio=1.0,
+    reset_after_warmup=False
 ):
     if not isinstance(num_training_steps, tuple):
         num_training_steps = (num_training_steps, ) * len(optimizer.param_groups)
@@ -664,6 +779,7 @@ def get_all_schedulers(
             last_epoch=last_epoch,
             cycle_ratio=cycle_ratio[i],
             param_group_indices=[i],
+            reset_after_warmup=reset_after_warmup
         )
         lambda_schedulers.append(scheduler)
     
@@ -685,6 +801,7 @@ def get_scheculer(
     last_epoch=-1,
     cycle_ratio=1.0,
     param_group_indices=None,
+    reset_after_warmup=False
 ):
     if adjust_step != 0 and scheduler_type != "cosine_restarts":
         raise ValueError("adjust_step is only supported for cosine_restarts scheduler")
@@ -803,7 +920,6 @@ def magnitude_pruning(tensor, prune_ratio):
 def _get_cyclical_cosine_schedule_with_min_lr_lambda(current_step, *, num_warmup_steps, cycle_length, min_lr_ratio, cycle_ratio=1.0):
     assert 0 < min_lr_ratio <= 1.0, "min_lr_ratio must be in (0,1]"
 
-    # compute where we are in the current cycle
     cycle_step = current_step % cycle_length
     cycle_number = current_step // cycle_length
 

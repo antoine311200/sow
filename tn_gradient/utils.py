@@ -4,6 +4,29 @@ from math import ceil
 
 from opt_einsum import contract
 
+def qr_weight(weight: torch.tensor, rank: int = None):
+    # Convertion to float is necessary for the QR decomposition
+    # as CUDA does not support QR decomposition for half precision
+    convertion = False
+    weight_device = weight.device
+    if weight.dtype != torch.float:
+        convertion = True
+
+        weight_type = weight.dtype
+        weight = weight.to(torch.float)
+
+    Q, R = torch.linalg.qr(weight)
+    if rank:
+        Q = Q[:, :rank]
+        R = R[:rank, :]
+
+    Q = Q.to(weight_device)
+    R = R.to(weight_device)
+    if convertion:
+        Q = Q.type(weight_type)
+        R = R.type(weight_type)
+
+    return Q, R
 
 def pad_matrix(matrix, new_shape):
     # pad_shape = [0, new_shape[1] - matrix.shape[1], 0, new_shape[0] - matrix.shape[0]]
