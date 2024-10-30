@@ -31,10 +31,10 @@ from tqdm import tqdm
 from loguru import logger
 
 from tn_gradient.optimizer.ttsgd import TTSGD
-from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
+# from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
-from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
+# from tn_gradient.layer.tensor_linear import TensorTrainLinear
+from tn_gradient.layer.sow import SoWLinear, SoWArgs
 from tn_gradient.prepare import prepare_sow, accumulate
 
 from galore_torch import GaLoreAdamW
@@ -89,8 +89,11 @@ def parse_args(args):
     parser.add_argument("--architecture", type=str, default="linear")
     parser.add_argument("--sow_accumulation", type=int, default=200)
     parser.add_argument("--sow_lr", type=float, default=0.0015)
-    parser.add_argument("--rank", type=int, default="4")
-    parser.add_argument("--n_iter", type=int, default="4")
+    parser.add_argument("--sow_scale", type=float, default=1)
+    parser.add_argument("--init_method", type=str, default="normal_QR")
+    # parser.add_argument("--sow_init", type=str, default="qr_xe")
+    parser.add_argument("--rank", type=int, default=100)
+    parser.add_argument("--n_iter", type=int, default=1)
     parser.add_argument("--lr_decay", type=float, default="1.0")
     parser.add_argument("--reset_scheduler", default=False, action="store_true")
     parser.add_argument("--accumulate_after_warmup", default=False, action="store_true")
@@ -254,14 +257,37 @@ def main(args):
     model_config = AutoConfig.from_pretrained(args.model_config)
     model = AutoModelForCausalLM.from_config(model_config)
     
-    if args.architecture == "sow":
-        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=args.dtype)
-        print(sow_args)
+    if args.architecture == "sow" or args.architecture == "lora":
+        sow_args = SoWArgs(
+            rank=args.rank,
+            n_iter=args.n_iter,
+            init_method=args.init_method,
+            scale=args.sow_scale,
+            dtype=args.dtype,
+            device=device,
+        )
+
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
         logger.info("Preparing SoW model")
         model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
         logger.info("SoW model prepared")
+
+        if args.architecture == "lora":
+            from math import sqrt
+            # Set accumulation step to be greater than the training steps
+            args.sow_accumulation = args.num_training_steps + 1
+            # Set accumulation matrix to be random and A to be zero
+            for _, module in model.named_modules():
+                if isinstance(module, SoWLinear):
+                    module.acc_downweight = torch.zeros(
+                        (module.in_features, module.out_features),
+                        dtype=torch.bfloat16 if args.dtype in ["bf16", "bfloat16"] else None,
+                        device=module.upscale_weights[0].device
+                    )
+                    nn.init.kaiming_uniform_(module.acc_downweight, a=sqrt(5))
+                    for i in range(0, module.n_iter):
+                        nn.init.zeros_(module.upscale_weights[i])
     
     local_step = 0 
     global_step = 0
@@ -297,7 +323,7 @@ def main(args):
         logger.info("*" * 40)
 
     special_params = []
-    if args.architecture == "sow":
+    if args.architecture == "sow" or args.architecture == "lora":
 
         for module_name, module in model.named_modules():
             if not isinstance(module, SoWLinear):
@@ -399,8 +425,8 @@ def main(args):
 
 
     if args.architecture == "sow" and args.reset_scheduler:
-        num_training_steps = (args.num_training_steps, args.sow_accumulation)
-        cycle_length = (None, args.sow_accumulation)
+        num_training_steps = (args.num_training_steps, args.sow_accumulation * args.gradient_accumulation)
+        cycle_length = (None, args.sow_accumulation * args.gradient_accumulation)
         cycle_ratio = (1.0, args.lr_decay)
     else:
         num_training_steps = args.num_training_steps
@@ -483,7 +509,7 @@ def main(args):
 
         if update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
             # print("\n")
-            logger.info("Accumulation & Reset optimizer states")
+            logger.info(f"Accumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
             accumulate(model)
 
             #  and args.reset_scheduler:

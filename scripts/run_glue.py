@@ -32,6 +32,7 @@ from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import wandb
 
 import transformers
 from transformers import (
@@ -53,7 +54,7 @@ from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
 from tn_gradient.tt import TensorTrain
 from tn_gradient.layer.tensor_linear import TensorTrainLinear
 from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow
+from tn_gradient.prepare import prepare_sow, accumulate
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.38.0.dev0")
 
@@ -219,10 +220,18 @@ def parse_args():
     # parser.add_argument("--galore_scale", type=float, default=1.0)
     # # proj_type
     # parser.add_argument("--proj_type", type=str, default="std")
-    parser.add_argument("--enable_sow", action="store_true")
+    # parser.add_argument("--enable_sow", action="store_true")
+    parser.add_argument("--architecture", type=str, default="linear")
     parser.add_argument("--rank", type=int, default=10)
     parser.add_argument("--n_iter", type=int, default=5)
+    parser.add_argument("--scale", type=float, default=8)
     parser.add_argument("--accumulation_steps", type=int, default=200)
+    parser.add_argument(
+        "--sow_lr",
+        type=float,
+        default=5e-5,
+        help="Initial learning rate (after the potential warmup period) to use.",
+    )
     # lora_all_modules
     # parser.add_argument("--lora_all_modules", action="store_true", help="Whether or not to use lora for all modules.")
     # eval_llama
@@ -251,6 +260,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    run_name = args.task_name + "_" + args.architecture + "_lr_" + str(args.learning_rate)
+    if args.architecture == "sow":
+        run_name += "_r_" + str(args.rank) + "_d_" + str(args.n_iter) + "_acc_" + str(args.accumulation_steps)
+
+    wandb.init(
+        project="glue-"+args.task_name,
+        name=run_name
+    )
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_no_trainer", args)
@@ -371,8 +390,20 @@ def main():
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
             trust_remote_code=args.trust_remote_code,
         )
-        if args.enable_sow:
-            sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, accumulation_steps=args.accumulation_steps)
+
+        if "roberta" in args.model_name_or_path:
+            for p in model.roberta.parameters():
+                p.requires_grad = True
+            for p in model.classifier.parameters():
+                p.requires_grad = True
+        
+        def f():
+            for p in model.parameters():
+                if p.requires_grad: yield p
+        print(next(f()).data[:5, :5])
+
+        if args.architecture == "sow":
+            sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, scale=args.scale)
 
             if "llama" in args.model_name_or_path:
                 target_modules = [
@@ -381,7 +412,10 @@ def main():
                 ]
             elif "roberta" in args.model_name_or_path:
                 target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
-            model = prepare_sow(model, target_modules, sow_args)
+            logger.info("Preparing SoW model")
+            model = prepare_sow(model, target_modules, decompose=True, args=sow_args)
+            logger.info("SoW model prepared")
+
             print(model)
     else:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
@@ -521,46 +555,70 @@ def main():
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     no_decay = ["bias", "LayerNorm.weight"]
+    optimizer_grouped_parameters = []
+    special_params = []
+    trainable_params = []
+    if args.architecture == "sow" or args.architecture == "lora":
+
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+
+            for downscale_weight in module.downscale_weights:
+                special_params.append(downscale_weight)
+            for upscale_weight in module.upscale_weights:
+                special_params.append(upscale_weight)
+            
+        id_params = [id(p) for p in special_params]
+        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in id_params]
+        for n, _ in trainable_params:
+            print(n)
+    elif args.architecture == "galore":
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+
+            special_params.append(module.weight)
+            
+        id_params = [id(p) for p in special_params]
+        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in id_params]
+    else:
+        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    
+    # model.named_parameters()
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [p for n, p in trainable_params if not any(nd in n for nd in no_decay)],
+            'lr': args.learning_rate,
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [p for n, p in trainable_params if any(nd in n for nd in no_decay)],
+            'lr': args.learning_rate,
             "weight_decay": 0.0,
         },
+        { 'params': special_params, 'lr': args.sow_lr, 'weight_decay': args.weight_decay}
     ]
-    
-    # if not args.enable_galore:
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
-    # else:
-    #     from torch import nn
-    #     # label layers for galore optimizer
-    #     # target_modules_list = ["attn", "mlp"]
-    #     # target_modules_list = ["q_proj", "v_proj"]
-    #     galore_params = []
-    #     for module_name, module in model.named_modules():
-    #         if not isinstance(module, nn.Linear):
-    #             continue
 
-    #         if not any(target_key in module_name for target_key in target_modules_list):
-    #             continue
+    memory_usage = sum(p.numel() for p in model.parameters())
+    memory_usage2 = sum(p.numel() for p in special_params)
+    memory_usage3 = sum(p.numel() for _, p in trainable_params)
+    # for n, p in model.named_parameters():
+    #     if p.requires_grad:
+    #         print(n)
+    logger.info("Total parameters: " + str(memory_usage))
+    logger.info("Special parameters: " + str(memory_usage2))
+    logger.info("Other trainable parameters: " + str(memory_usage3))
 
-    #         print('enable GaLore for weights in module: ', module_name)
-    #         galore_params.append(module.weight)
-
-    #     id_galore_params = [id(p) for p in galore_params]
-    #     # make parameters without "rank" to another group
-    #     regular_params = [p for p in model.parameters() if id(p) not in id_galore_params]
-    #     # then call galore_adamw
-    #     param_groups = [{'params': regular_params}, 
-    #                     {'params': galore_params, 'rank': args.lora_r, 'update_proj_gap': args.update_proj_gap, 'scale': args.galore_scale, 'proj_type': args.proj_type}]
-    #     optimizer = GaLoreAdamW(param_groups, lr=args.learning_rate)
-    
-    # Set all layers to be trainable
-    # for param in model.parameters():
-    #     param.requires_grad = True
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -650,6 +708,18 @@ def main():
             completed_steps = resume_step // args.gradient_accumulation_steps
             resume_step -= starting_epoch * len(train_dataloader)
 
+
+
+
+
+
+
+
+
+
+
+
+
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
 
@@ -660,25 +730,21 @@ def main():
         logger.info(f"***** Epoch {epoch} *****")
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num trainable parameters = {trainable_params}")
-        if args.with_tracking:
-            total_loss = 0
+        # if args.with_tracking:
+        total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
         else:
             active_dataloader = train_dataloader
 
-        # print(model.roberta.encoder.layer[5].intermediate.dense.accumulated_weight)
-        # print(model.roberta.encoder.layer[5].intermediate.dense.downscale_weights[0])
-        # print(model.roberta.encoder.layer[5].intermediate.dense.upscale_weights[0])
-
         for step, batch in enumerate(active_dataloader):
 
             outputs = model(**batch)
             loss = outputs.loss
             # We keep track of the loss at each epoch
-            if args.with_tracking:
-                total_loss += loss.detach().float()
+            # if args.with_tracking:
+            total_loss += loss.detach().float()
             loss = loss / args.gradient_accumulation_steps
             accelerator.backward(loss)
             if step % args.gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
@@ -688,6 +754,35 @@ def main():
                 progress_bar.update(1)
                 completed_steps += 1
 
+                # def f():
+                #     for p in model.parameters():
+                #         if p.requires_grad: yield p
+                # print(next(f()).data[:5, :5])
+
+            if completed_steps > 0 and completed_steps % args.accumulation_steps == 0 and args.architecture == "sow":
+                logger.info(f"Accumulation & Reset optimizer states (step {completed_steps})")
+                accumulate(model)
+
+                group = optimizer.param_groups[2]
+                for param in group["params"]:
+                    state = optimizer.state[param]
+                    # Exponential moving average of gradient values
+                    state["exp_avg"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+                    # Exponential moving average of squared gradient values
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+                    if group["amsgrad"]:
+                        # Maintains max of all exp. moving avg. of sq. grad. values
+                        state["max_exp_avg_sq"] = torch.zeros_like(
+                            param, memory_format=torch.preserve_format
+                        )
+
+                    state["step"] = torch.zeros_like(state["step"])
+
+
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
                     output_dir = f"step_{completed_steps}"
@@ -695,8 +790,15 @@ def main():
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
 
+            wandb.log({
+                "loss": loss.item(),
+                "lr": optimizer.param_groups[0]["lr"],
+                "sow_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None
+            }, step=completed_steps)
+
             if completed_steps >= args.max_train_steps:
                 break
+
 
         model.eval()
         samples_seen = 0
@@ -730,6 +832,14 @@ def main():
                 },
                 step=completed_steps,
             )
+
+        wandb.log({
+                "accuracy" if args.task_name is not None else "glue": eval_metric,
+                "train_loss": total_loss.item() / len(train_dataloader),
+                "epoch": epoch,
+                "step": completed_steps,
+            },
+            step=completed_steps)
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
