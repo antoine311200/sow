@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from math import ceil
 
 from opt_einsum import contract
+from scipy.stats import ortho_group
 
 def qr_weight(weight: torch.tensor, rank: int = None):
     # Convertion to float is necessary for the QR decomposition
@@ -27,6 +28,25 @@ def qr_weight(weight: torch.tensor, rank: int = None):
         R = R.type(weight_type)
 
     return Q, R
+
+def randhaar(n):
+    """Generates a random n x n orthogonal matrix Q with Haar distribution."""
+    Q = torch.tensor(ortho_group.rvs(dim=n), dtype=torch.float32)
+    return Q
+
+def randuptri(n, scale=1.0):
+    """Generates a random upper triangular matrix R with scaled chi-distributed diagonal entries."""
+    R = torch.triu(torch.randn(n, n))
+    for i in range(n):
+        # Set each diagonal element as a scaled chi-distributed value
+        R[i, i] = torch.sqrt(torch.distributions.Chi2(df=n-i).sample()) * scale
+    return R
+
+def perturbe_random(matrix: torch.tensor, scale=0.02):
+    """Perturbe a matrix by a random gaussian noise"""
+    noise = torch.randn(matrix.size(), device=matrix.device) * scale
+    perturbed_matrix = matrix + noise
+    return perturbed_matrix
 
 def pad_matrix(matrix, new_shape):
     # pad_shape = [0, new_shape[1] - matrix.shape[1], 0, new_shape[0] - matrix.shape[0]]

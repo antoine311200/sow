@@ -8,7 +8,7 @@ from typing import List
 
 from dataclasses import dataclass
 
-from tn_gradient.utils import qr_weight
+from tn_gradient.utils import qr_weight, perturbe_random, randhaar, randuptri
 
 @dataclass
 class SoWArgs:
@@ -102,15 +102,30 @@ class SoWLinear(nn.Module):
         self.step += 1
 
     def reset_parameters(self, reset_scale=1.0) -> None:
-        weight = torch.zeros((self.in_features, self.out_features))                
+        if "normal_QR" in self.init_method:
+            weight = torch.zeros((self.in_features, self.out_features))
+
+        if self.init_method == "fast_normal_QR":
+            # Precomputation of the QR decomposition         
+            nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
+            q_weight, r_weight = qr_weight(weight, self.rank)
 
         for i in range(self.n_iter):
             if i / self.n_iter >= 1 - reset_scale:
                 if self.init_method == "normal_QR":
                     nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
                     q_weight, r_weight = qr_weight(weight, self.rank)
-                    self.downscale_weights[i] = q_weight
-                    self.upscale_weights[i] = r_weight
+                    self.downscale_weights[i] = q_weight.contiguous()
+                    self.upscale_weights[i] = r_weight.contiguous()
+                elif self.init_method == "fast_normal_QR":
+                    # haar_matrix = randhaar(self.downscale_weights[i].shape[0])
+                    # uptri_matrix = randuptri(self.downscale_weights[i].shape[0], scale=0.02)
+                    # print("Haar", haar_matrix.shape, self.downscale_weights[i].shape)
+                    # print("Upper Tri", uptri_matrix.shape, self.upscale_weights[i].shape)
+                    # self.downscale_weights[i] = haar_matrix[:, :self.downscale_weights[i].shape[1]]
+                    # self.upscale_weights[i] = uptri_matrix[:self.upscale_weights[i].shape[0], :]
+                    self.downscale_weights[i] = perturbe_random(q_weight)
+                    self.upscale_weights[i] = perturbe_random(r_weight)
                 elif self.init_method == "uniform":
                     nn.init.uniform_(self.downscale_weights[i], -1, 1)
                     nn.init.uniform_(self.upscale_weights[i], -1, 1)
@@ -164,18 +179,6 @@ class SoWLinear(nn.Module):
         # only if the virtual rank is less than the full-rankness
         if self.virtual_rank < min(self.in_features, self.out_features):
 
-            # convertion = False
-            # if accumalation.dtype != torch.float:
-            #     convertion = True
-
-            #     weight_type = accumalation.dtype
-            #     weight_device = accumalation.device
-            #     accumalation = accumalation.to(torch.float)
-
-            # Q, R = torch.linalg.qr(accumalation)
-            # Q = Q[:, :self.virtual_rank]
-            # R = R[:self.virtual_rank, :]
-
             self.acc_downweight, self.acc_upweight = qr_weight(accumalation, rank=self.virtual_rank)
             self.acc_downweight.requires_grad = False
             self.acc_upweight.requires_grad = False
@@ -193,16 +196,26 @@ class SoWLinear(nn.Module):
         new_upscale_weights = [torch.zeros_like(x) for x in self.upscale_weights]
 
         # Change initializations
-        weight = torch.zeros((self.in_features, self.out_features))
-        weight = weight.to(self.acc_downweight.device)              
-        weight = weight.type(self.acc_downweight.dtype)
+        if "normal_QR" in self.init_method:
+            weight = torch.zeros((self.in_features, self.out_features))
+            weight = weight.to(self.acc_downweight.device)              
+            weight = weight.type(self.acc_downweight.dtype)
         
+        if self.init_method == "fast_normal_QR":
+            nn.init.normal_(weight, mean=0.0, std=0.01)
+            q_weight, r_weight = qr_weight(weight, self.rank)
+
         for i in range(0, self.n_iter):
             # Do not reinitialize the upscale weights other than zero for continuity of the accumulation
             if self.init_method == "normal_QR":
-                nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
+                nn.init.normal_(weight, mean=0.0, std=0.002) # hardcoded value std=0.02 from Llama config
                 q_weight, _ = qr_weight(weight, self.rank)
-                new_downscale_weights[i] = q_weight
+                new_downscale_weights[i] = q_weight.contiguous()
+            elif self.init_method == "fast_normal_QR":
+                self.downscale_weights[i] = perturbe_random(q_weight)
+                # haar_matrix = randhaar(self.downscale_weights[i].shape[0])
+                # print("Haar", haar_matrix.shape, self.downscale_weights[i])
+                # self.downscale_weights[i] = haar_matrix[:, :self.downscale_weights[i].shape[1]]
             elif self.init_method == "uniform":
                 nn.init.uniform_(new_downscale_weights[i], -1, 1)
             else:
