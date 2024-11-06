@@ -23,7 +23,7 @@ from torch.autograd.profiler import record_function
 
 import transformers
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
-from safetensors.torch import load_model
+from safetensors.torch import load_model, load_file
 
 import datasets
 import datasets.distributed
@@ -35,7 +35,7 @@ from loguru import logger
 from tn_gradient.optimizer.ttsgd import TTSGD
 from tn_gradient.tt import TensorTrain
 from tn_gradient.layer.sow import SoWLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow, accumulate
+from tn_gradient.prepare import prepare_sow, accumulate, load_sow
 
 from utils.dataloader import PreprocessedIterableDataset, batch_fn
 from utils.args_utils import check_args_torchrun_main
@@ -108,9 +108,7 @@ def parse_args(args):
         args.save_dir = f"checkpoints/{args.model_config.split('/')[-1].rstrip('.json')}-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
 
     return args
-
-
-
+ 
 
 
 
@@ -325,6 +323,8 @@ def main(args):
         model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
         logger.info("SoW model prepared")
 
+        print(model.model.layers[1].self_attn.q_proj.downscale_weights[0].data)
+
         if args.architecture == "lora":
             from math import sqrt
             # Set accumulation step to be greater than the training steps
@@ -348,12 +348,18 @@ def main(args):
     tokens_seen_before = 0
 
     if args.continue_from is not None:
-        logger.info(f"Loading model from {args.resume_from}")
+        logger.info(f"Loading model from {args.continue_from}")
         checkpoint_path = os.path.join(args.continue_from, "model.safetensors")
-        load_model(model, checkpoint_path)
-        logger.info(f"Model successfully loaded (strict=True policy)")
 
-        logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.resume_from}")
+        if args.architecture == "sow":
+            load_sow(model, checkpoint_path)
+        else:
+            load_model(model, checkpoint_path)
+        
+        
+        logger.info(f"Model successfully loaded (strict=True policy)")
+        print(model.model.layers[1].self_attn.q_proj.downscale_weights[0].data)
+
         if os.path.exists(os.path.join(args.continue_from, "training_state.json")):
             logger.info(f"Loading training state like global_step, update_step, and tokens_seen from {args.continue_from}")
             with open(os.path.join(args.continue_from, "training_state.json")) as f:
@@ -512,6 +518,8 @@ def main(args):
                 _old_training_config = yaml.safe_load(f)
             if args.batch_size != _old_training_config["batch_size"]:
                 raise RuntimeError("Cannot resume from a checkpoint with a different batch size.")
+            if args.eval:
+                args = _old_training_config
 
 
     if not args.single_gpu:
@@ -531,7 +539,7 @@ def main(args):
         total_loss, evaluated_on_tokens = evaluate_model(
             model, preprocess_batched, pad_idx, global_rank, world_size, device, args.batch_size
         )
-        logger.info(f"Eval loss : {total_loss}")
+        logger.info(f"Eval loss : {total_loss} | Perplexity : {np.exp(total_loss)}")
 
         sys.exit()
 
@@ -569,7 +577,7 @@ def main(args):
         offset = (int(args.warmup_steps * args.num_training_steps) if args.accumulate_after_warmup else 0)
         accumulation_step = int(args.gradient_accumulation * args.sow_accumulation)
 
-        if update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
+        if global_step % args.gradient_accumulation and update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
             logger.info(f"Accumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
             accumulate(model)
             reset_scheduler(optimizer, group_id=1) # reset the second parameter group    
@@ -618,7 +626,7 @@ def main(args):
                     },
                     step=global_step,
                 )
-            logger.info(f"Eval loss at step {update_step}: {total_loss}")
+            logger.info(f"Eval loss at step {update_step}: {total_loss} | Perplexity : {np.exp(total_loss)}")
 
         lr = optimizer.param_groups[0]["lr"]
         sow_lr = optimizer.param_groups[1]["lr"] if args.architecture == "sow" else None

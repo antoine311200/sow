@@ -2,6 +2,7 @@ from math import sqrt
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 
 from tn_gradient.layer.sow import SoWLinear, SoWArgs
 
@@ -136,6 +137,37 @@ def prepare_sow(
             setattr(model, name, new_layer)
 
     return model
+
+
+def load_sow(model, checkpoint_path):
+    """Load a model with SoW layers from a safetensor checkpoint file."""
+    loaded_tensors = load_file(checkpoint_path)
+
+    def get_nested_attr(model, name):
+        parts = name.split(".")
+        attr = model
+        for part in parts:
+            attr = getattr(attr, part)
+        return attr
+    
+    for name, param in loaded_tensors.items():
+        if name in model.state_dict():
+            try:
+                model_param = get_nested_attr(model, name)
+            except AttributeError:
+                print(f"Attribute '{name}' not found in model.")
+
+            if model_param.numel() == 0:
+                cloned_param = nn.Parameter(param.clone(), requires_grad=False)
+                if "." in name:
+                    parent_name, child_name = name.rsplit(".", 1)
+                    parent_module = dict(model.named_modules())[parent_name]
+                    setattr(parent_module, child_name, cloned_param)
+                else:
+                    setattr(model, name, cloned_param)
+            else:
+                model_param.data.copy_(param.data)
+
 
 
 def accumulate(model):

@@ -73,11 +73,10 @@ class SoWLinear(nn.Module):
         self.n_iter = n_iter
         self.rank = rank
         self.scale = scale
-        self.step = 0
         self.virtual_rank = min(rank * n_iter, in_features, out_features)
 
-        self.acc_upweight = None
-        self.acc_downweight = None
+        self.acc_upweight = nn.Parameter(torch.empty(0), requires_grad=False)
+        self.acc_downweight = nn.Parameter(torch.empty(0), requires_grad=False)
 
         self.init_method = init_method
 
@@ -94,12 +93,6 @@ class SoWLinear(nn.Module):
             self.register_parameter("bias", None)
 
         self.reset_parameters()
-
-        # Add a hook to step the model at each backward pass
-        self.register_full_backward_hook(self._step)
-
-    def _step(self, module, grad_input, grad_output):
-        self.step += 1
 
     def reset_parameters(self, reset_scale=1.0) -> None:
         if "normal_QR" in self.init_method:
@@ -141,9 +134,9 @@ class SoWLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = None
-        if self.acc_downweight is not None and self.acc_upweight is not None:
+        if self.acc_downweight.numel() != 0 and self.acc_upweight.numel() != 0:
             out = (x @ self.acc_downweight) @ self.acc_upweight
-        elif self.acc_downweight is not None and self.acc_upweight is None:
+        elif self.acc_downweight.numel() != 0 and self.acc_upweight.numel() == 0:
             out = x @ self.acc_downweight
 
         for downscale_weight, upscale_weight in zip(
@@ -170,26 +163,25 @@ class SoWLinear(nn.Module):
         ]), dim=0).detach()
 
         # Compute the full W_acc matrix from the previous accumulated weights
-        if self.acc_downweight is not None and self.acc_upweight is not None:
+        if self.acc_downweight.numel() != 0 and self.acc_upweight.numel() != 0:
             accumalation = accumalation.to(self.acc_upweight.device) + self.acc_downweight @ self.acc_upweight
-        elif self.acc_downweight is not None and self.acc_upweight is None:
+        elif self.acc_downweight.numel() != 0 and self.acc_upweight.numel() == 0:
             accumalation = accumalation.to(self.acc_downweight.device) + self.acc_downweight
 
         # Perform QR decomposition to get the new accumulated weights
         # only if the virtual rank is less than the full-rankness
         if self.virtual_rank < min(self.in_features, self.out_features):
 
-            self.acc_downweight, self.acc_upweight = qr_weight(accumalation, rank=self.virtual_rank)
-            self.acc_downweight.requires_grad = False
-            self.acc_upweight.requires_grad = False
+            Q, R = qr_weight(accumalation, rank=self.virtual_rank)
+            self.acc_downweight = nn.Parameter(Q.contiguous(), requires_grad=False)
+            self.acc_upweight = nn.Parameter(R.contiguous(), requires_grad=False)
             
             self.virtual_rank = min(self.virtual_rank + self.rank * self.n_iter, self.in_features, self.out_features)
-            torch.cuda.empty_cache()
         else:
-            self.acc_downweight = accumalation
-            self.acc_downweight.requires_grad = False
-            self.acc_upweight = None
-            torch.cuda.empty_cache()
+            self.acc_downweight = nn.Parameter(accumalation, requires_grad=False)
+            self.acc_upweight = nn.Parameter(torch.empty(0), requires_grad=False)
+
+        torch.cuda.empty_cache()
 
         # Reset weights
         new_downscale_weights = [torch.zeros_like(x) for x in self.downscale_weights]
@@ -203,7 +195,7 @@ class SoWLinear(nn.Module):
         
         if self.init_method == "fast_normal_QR":
             nn.init.normal_(weight, mean=0.0, std=0.01)
-            q_weight, r_weight = qr_weight(weight, self.rank)
+            q_weight, _ = qr_weight(weight, self.rank)
 
         for i in range(0, self.n_iter):
             # Do not reinitialize the upscale weights other than zero for continuity of the accumulation
