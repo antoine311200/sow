@@ -65,6 +65,7 @@ class SoWLinear(nn.Module):
         init_method: str = "normal_QR",
         device=None,
         dtype=None,
+        init_params=True
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super(SoWLinear, self).__init__()
@@ -92,48 +93,29 @@ class SoWLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self.reset_parameters()
+        if init_params:
+            self.reset_parameters()
 
     def reset_parameters(self, reset_scale=1.0) -> None:
         if "normal_QR" in self.init_method:
-            weight = torch.zeros((self.in_features, self.out_features))
-
-        if self.init_method == "fast_normal_QR":
-            # Precomputation of the QR decomposition         
-            nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
-            q_weight, r_weight = qr_weight(weight, self.rank)
+            weight = torch.zeros((self.in_features, self.out_features)).to("cuda")
 
         for i in range(self.n_iter):
             if i / self.n_iter >= 1 - reset_scale:
                 if self.init_method == "normal_QR":
                     nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
                     q_weight, r_weight = qr_weight(weight, self.rank)
-                    self.downscale_weights[i] = q_weight.contiguous()
-                    self.upscale_weights[i] = r_weight.contiguous()
-                elif self.init_method == "fast_normal_QR":
-                    # haar_matrix = randhaar(self.downscale_weights[i].shape[0])
-                    # uptri_matrix = randuptri(self.downscale_weights[i].shape[0], scale=0.02)
-                    # print("Haar", haar_matrix.shape, self.downscale_weights[i].shape)
-                    # print("Upper Tri", uptri_matrix.shape, self.upscale_weights[i].shape)
-                    # self.downscale_weights[i] = haar_matrix[:, :self.downscale_weights[i].shape[1]]
-                    # self.upscale_weights[i] = uptri_matrix[:self.upscale_weights[i].shape[0], :]
-                    self.downscale_weights[i] = perturbe_random(q_weight)
-                    self.upscale_weights[i] = perturbe_random(r_weight)
-                elif self.init_method == "uniform":
-                    nn.init.uniform_(self.downscale_weights[i], -1, 1)
-                    nn.init.uniform_(self.upscale_weights[i], -1, 1)
-                elif self.init_method == "kaiming_uniform":
-                    nn.init.kaiming_uniform_(self.downscale_weights[i])
-                    nn.init.kaiming_uniform_(self.upscale_weights[i])
-                elif self.init_method == "kaiming_normal":
-                    nn.init.kaiming_normal_(self.downscale_weights[i])
-                    nn.init.kaiming_normal_(self.upscale_weights[i])
+                    self.downscale_weights[i] = q_weight.to(self.downscale_weights[i].device).contiguous()
+                    self.upscale_weights[i] = r_weight.to(self.upscale_weights[i].device).contiguous()
+                else:
+                    nn.init.normal_(self.downscale_weights[i], std=0.02)
+                    nn.init.normal_(self.upscale_weights[i], std=0.02)
 
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = None
+        out = torch.empty(0, device=self.downscale_weights[0].device)
         if self.acc_downweight.numel() != 0 and self.acc_upweight.numel() != 0:
             out = (x @ self.acc_downweight) @ self.acc_upweight
         elif self.acc_downweight.numel() != 0 and self.acc_upweight.numel() == 0:
@@ -142,9 +124,8 @@ class SoWLinear(nn.Module):
         for downscale_weight, upscale_weight in zip(
             self.downscale_weights, self.upscale_weights
         ):
-            output = x @ downscale_weight
-            output = output @ upscale_weight
-            if out is not None:
+            output = x @ downscale_weight @ upscale_weight
+            if out.numel() != 0:
                 out += output * self.scale
             else:
                 out = output * self.scale
@@ -157,7 +138,7 @@ class SoWLinear(nn.Module):
     def accumulate(self):
 
         # Accumulate the weights
-        accumalation = torch.sum(torch.stack([
+        accumalation = self.scale * torch.sum(torch.stack([
             a.detach() @ b.detach() 
             for a, b in zip(self.downscale_weights, self.upscale_weights)
         ]), dim=0).detach()
@@ -192,24 +173,13 @@ class SoWLinear(nn.Module):
             weight = torch.zeros((self.in_features, self.out_features))
             weight = weight.to(self.acc_downweight.device)              
             weight = weight.type(self.acc_downweight.dtype)
-        
-        if self.init_method == "fast_normal_QR":
-            nn.init.normal_(weight, mean=0.0, std=0.01)
-            q_weight, _ = qr_weight(weight, self.rank)
 
         for i in range(0, self.n_iter):
             # Do not reinitialize the upscale weights other than zero for continuity of the accumulation
             if self.init_method == "normal_QR":
-                nn.init.normal_(weight, mean=0.0, std=0.002) # hardcoded value std=0.02 from Llama config
+                nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama/Roberta config
                 q_weight, _ = qr_weight(weight, self.rank)
                 new_downscale_weights[i] = q_weight.contiguous()
-            elif self.init_method == "fast_normal_QR":
-                self.downscale_weights[i] = perturbe_random(q_weight)
-                # haar_matrix = randhaar(self.downscale_weights[i].shape[0])
-                # print("Haar", haar_matrix.shape, self.downscale_weights[i])
-                # self.downscale_weights[i] = haar_matrix[:, :self.downscale_weights[i].shape[1]]
-            elif self.init_method == "uniform":
-                nn.init.uniform_(new_downscale_weights[i], -1, 1)
             else:
                 nn.init.normal_(new_downscale_weights[i], std=0.02)
 

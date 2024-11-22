@@ -29,6 +29,33 @@ def qr_weight(weight: torch.tensor, rank: int = None):
 
     return Q, R
 
+def svd_weight(weight: torch.tensor, rank: int = None):
+    # Convertion to float is necessary for the SVD decomposition
+    # as CUDA does not support QR decomposition for half precision
+    convertion = False
+    weight_device = weight.device
+    if weight.dtype != torch.float:
+        convertion = True
+
+        weight_type = weight.dtype
+        weight = weight.to(torch.float)
+
+    U, S, V = torch.linalg.svd(weight)
+    if rank:
+        U = U[:, :rank]
+        S = S[:rank]
+        V = V[:rank, :]
+
+    U = U.to(weight_device)
+    S = S.to(weight_device)
+    V = V.to(weight_device)
+    if convertion:
+        U = U.type(weight_type)
+        S = S.type(weight_type)
+        V = V.type(weight_type)
+
+    return U, S, V
+
 def randhaar(n):
     """Generates a random n x n orthogonal matrix Q with Haar distribution."""
     Q = torch.tensor(ortho_group.rvs(dim=n), dtype=torch.float32)

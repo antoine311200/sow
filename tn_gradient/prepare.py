@@ -1,13 +1,16 @@
+import os
 from math import sqrt
 
+import numpy as np
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
-
+from tqdm import tqdm
 from tn_gradient.layer.sow import SoWLinear, SoWArgs
+from tn_gradient.utils import svd_weight
 
 def prepare_sow(
-    model, target_modules, decompose: bool = True, args: SoWArgs = SoWArgs()
+    model, target_modules, decompose: bool = 'qr', args: SoWArgs = SoWArgs()
 ):
     """Code for preparing the model for the Sum-of-Weights decomposition.
 
@@ -53,6 +56,8 @@ def prepare_sow(
         if check_module(name, module):
             layers_to_replace[name] = module
 
+    pbar = tqdm(total=len(layers_to_replace.items()), desc="Prepare model", ncols=50)
+
     for name, module in layers_to_replace.items():
         # # Convertion to float is necessary for the QR decomposition
         # # as CUDA does not support QR decomposition for half precision
@@ -75,51 +80,38 @@ def prepare_sow(
             bias=module.bias is not None,
             dtype=module.weight.data.dtype,
             device=args.device,
+            init_params=decompose!='qr'
         )
+        new_layer.virtual_rank = min(module.in_features, module.out_features)
 
-        # print(new_layer.upscale_weights[0].data[:5, :5])        
+        if decompose == 'qr':
+            keep_rank = args.rank * args.n_iter
+            Q, R = torch.linalg.qr(module.weight.data.T.to("cuda"))
+            Q_major, Q_minor = (
+                Q[:, :-keep_rank],
+                Q[:, -keep_rank:],
+            )
+            R_major, R_minor = (
+                R[:-keep_rank, :],
+                R[-keep_rank:, :],
+            )
 
-        # if decompose:
-        #     for _, (downscale_weight, upscale_weight) in enumerate(
-        #         zip(new_layer.downscale_weights, new_layer.upscale_weights)
-        #     ):
-        #         nn.init.zeros_(downscale_weight)
-        #         # nn.init.zeros_(upscale_weight)
-        #         # nn.init.kaiming_uniform_(downscale_weight)# a=sqrt(5))
-        #         nn.init.kaiming_uniform_(upscale_weight)# a=sqrt(5))
-                
-        #         downscale_weight.requires_grad = True
-        #         upscale_weight.requires_grad = True
+            W = Q_major @ R_major
+            W = Q_major @ R_major
+            A = torch.split(Q_minor, args.rank, dim=1)
+            B = torch.split(R_minor, args.rank, dim=0)
 
-        #     new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device))
-        #     # nn.init.zeros_(new_layer.acc_downweight)
-        #     new_layer.acc_downweight.requires_grad = False
+            new_layer.downscale_weights.from_weights(A)
+            new_layer.upscale_weights.from_weights(B)
+            # new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
+            new_layer.acc_downweight = nn.Parameter(W.to(args.device).contiguous(), requires_grad=False)
 
-            # keep_rank = args.rank * args.n_iter
-            # Q, R = torch.linalg.qr(module.weight.data.T)
-            # Q_major, Q_minor = (
-            #     Q[:, :-keep_rank],
-            #     Q[:, -keep_rank:],
-            # )
-            # R_major, R_minor = (
-            #     R[:-keep_rank, :],
-            #     R[-keep_rank:, :],
-            # )
-
-            # W = Q_major @ R_major
-            # A = torch.split(Q_minor, args.rank, dim=1)
-            # B = torch.split(R_minor, args.rank, dim=0)
-
-            # new_layer.downscale_weights.from_weights(A)
-            # new_layer.upscale_weights.from_weights(B)
-            # new_layer.acc_downweight = W.to(args.device)
-            # for up_weight in new_layer.upscale_weights:
-            #     up_weight.require_grad = True
-            # for down_weight in new_layer.downscale_weights:
-            #     down_weight.require_grad = True
-            # new_layer.acc_downweight.require_grad = False
-        # print(new_layer.upscale_weights[0].data[:5, :5])        
-        # print()
+            for up_weight in new_layer.upscale_weights:
+                up_weight.require_grad = True
+            for down_weight in new_layer.downscale_weights:
+                down_weight.require_grad = True
+        elif decompose == 'keep':
+            new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
 
         if module.bias is not None:
             new_layer.bias = module.bias
@@ -135,6 +127,8 @@ def prepare_sow(
             setattr(parent_module, child_name, new_layer)
         else:
             setattr(model, name, new_layer)
+        
+        pbar.update(1)
 
     return model
 
@@ -174,3 +168,26 @@ def accumulate(model):
     for _, module in model.named_modules():
         if isinstance(module, SoWLinear):
             module.accumulate()
+
+def export_alignment(module, export_name):
+    if not isinstance(module, SoWLinear):
+        raise TypeError("Not a SoW layer")
+    
+    accumalation = torch.sum(torch.stack([
+        a.detach() @ b.detach() 
+        for a, b in zip(module.downscale_weights, module.upscale_weights)
+    ]), dim=0).detach()
+
+    if module.acc_upweight.numel() != 0:
+        weight = module.acc_downweight @ module.acc_upweight
+    else:
+        weight = module.acc_downweight
+
+    U_acc, S_acc, V_acc = svd_weight(accumalation, module.rank)
+    U_w, S_w, V_w = svd_weight(weight)
+
+    alignment_grid = torch.abs(U_w.T @ U_acc)
+    alignment_percentage = (alignment_grid / alignment_grid.sum(axis=0)) * 100
+
+    alignment_percentage = alignment_percentage.detach().cpu().numpy()
+    np.save(os.path.join('/home/antoine/code/tn_gradient/scripts/data/align', export_name+'.npy'), alignment_percentage)
