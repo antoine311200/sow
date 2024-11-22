@@ -39,7 +39,7 @@ from tn_gradient.prepare import prepare_sow, accumulate, load_sow
 
 from utils.dataloader import PreprocessedIterableDataset, batch_fn
 from utils.args_utils import check_args_torchrun_main
-from utils.training_utils import get_all_schedulers, reset_scheduler
+from utils.training_utils import get_all_schedulers, reset_optimizer
 from utils.memory_utils import calculate_optimizer_memory_usage, calculate_weight_usage
 
 from galore_torch import GaLoreAdamW
@@ -376,6 +376,14 @@ def main(args):
         else:
             logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
         logger.info("*" * 40)
+    
+
+    import sys
+    import time
+    for batch in dataloader:
+        model(batch).loss.backward()
+        time.sleep(20000000)
+        sys.exit()
 
 
     special_params = []
@@ -580,7 +588,7 @@ def main(args):
         if global_step % args.gradient_accumulation and update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
             logger.info(f"Accumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
             accumulate(model)
-            reset_scheduler(optimizer, group_id=1) # reset the second parameter group    
+            reset_optimizer(optimizer, group_id=1) # reset the second parameter group    
 
         if global_step % args.gradient_accumulation != 0:
             continue

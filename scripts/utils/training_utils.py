@@ -254,7 +254,7 @@ def _get_cosine_schedule_with_multiple_warmups_lambda(
 
     return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
 
-def reset_scheduler(optimizer, group_id):
+def reset_optimizer(optimizer, group_id):
     # Clear the optimizer states of the specified param groups
     group = optimizer.param_groups[group_id]
     for param in group["params"]:
