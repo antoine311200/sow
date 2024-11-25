@@ -49,12 +49,14 @@ from transformers import (
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from tn_gradient.optimizer.ttsgd import TTSGD
-from tn_gradient.optimizer.ttadam import TTAdam, TTRAdam
-from tn_gradient.tt import TensorTrain
-from tn_gradient.layer.tensor_linear import TensorTrainLinear
-from tn_gradient.layer.sow import SoWLinear, SumTTLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow, accumulate
+from peft import LoraConfig, get_peft_model, TaskType
+
+from tn_gradient.layer.sow import SoWLinear, SoWArgs
+from tn_gradient.prepare import prepare_sow, accumulate, export_alignment
+
+from utils.training_utils import reset_optimizer
+from utils.memory_utils import calculate_weight_usage
+
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.38.0.dev0")
 
@@ -63,17 +65,48 @@ logger = get_logger(__name__)
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
 task_to_keys = {
-    "cola": ("sentence", None),
+    "cola": ("sentence", ),
     "mnli": ("premise", "hypothesis"),
     "mrpc": ("sentence1", "sentence2"),
     "qnli": ("question", "sentence"),
     "qqp": ("question1", "question2"),
     "rte": ("sentence1", "sentence2"),
-    "sst2": ("sentence", None),
+    "sst2": ("sentence", ),
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
+
 }
 
+more_task_to_keys = {
+    "google/boolq": ("question", "passage"),
+    "allenai/winogrande": ("sentence", "option1", "option2"),
+    "ybisk/piqa": ("goal", "sol1", "sol2"),
+    "allenai/social_i_qa": ("context", "question", "answerA", "answerB", "answerC"),
+    "allenai/openbookqa": ("question_stem", "choices"),
+    "Rowan/hellaswag": ("activity_label", "ctx", "endings")
+}
+more_task_to_labels = {
+    "google/boolq": "answer",
+    "allenai/winogrande": "answer",
+    "ybisk/piqa": "label",
+    "allenai/social_i_qa": "label",
+    "allenai/openbookqa": "answerKey",
+    "Rowan/hellaswag": "label"
+}
+more_task_to_process = {
+    "allenai/openbookqa": { "choices": lambda x: x["text"]},
+    # "Rowan/hellaswag": { "endings": lambda x: x},
+}
+
+def flatten_list(input_list):
+    """Flattens a list containing strings and sublists of strings."""
+    flat_list = []
+    for element in input_list:
+        if isinstance(element, list):
+            flat_list.extend(flatten_list(element))
+        else:
+            flat_list.append(element)
+    return flat_list
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
@@ -87,7 +120,13 @@ def parse_args():
         type=str,
         default=None,
         help="The name of the glue task to train on.",
-        choices=list(task_to_keys.keys()),
+        choices=list(task_to_keys.keys())+list(more_task_to_keys.keys()),
+    )
+    parser.add_argument(
+        "--task_split",
+        type=str,
+        default=None,
+        help="The name of the split task to train on.",
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
@@ -221,24 +260,28 @@ def parse_args():
     # # proj_type
     # parser.add_argument("--proj_type", type=str, default="std")
     # parser.add_argument("--enable_sow", action="store_true")
+    parser.add_argument('--eval_every', type=int, default=5000)
+
+    # LoRA aguments
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    
+
+    # SoW arguments
     parser.add_argument("--architecture", type=str, default="linear")
     parser.add_argument("--rank", type=int, default=10)
-    parser.add_argument("--n_iter", type=int, default=5)
-    parser.add_argument("--scale", type=float, default=8)
+    parser.add_argument("--n_iter", type=int, default=1)
+    parser.add_argument("--scale", type=float, default=1)
+    parser.add_argument("--init_method", type=str, default="normal_QR")
     parser.add_argument("--accumulation_steps", type=int, default=200)
-    parser.add_argument(
-        "--sow_lr",
-        type=float,
-        default=5e-5,
-        help="Initial learning rate (after the potential warmup period) to use.",
-    )
-    # lora_all_modules
-    # parser.add_argument("--lora_all_modules", action="store_true", help="Whether or not to use lora for all modules.")
-    # eval_llama
+    parser.add_argument("--mode", type=str, default='qr')
+    parser.add_argument("--sow_lr", type=float, default=5e-5, help="Initial learning rate (after the potential warmup period) to use.")
+
+
     parser.add_argument("--eval_llama", action="store_true", help="Whether or not to evaluate llama model.")
-    # low_rank_method
-    # parser.add_argument("--low_rank_method", type=str, default=None, help="low rank method for wandb sweep")
-    
+    parser.add_argument("--wandb_off", default=False, action="store_true")
+
     args = parser.parse_args()
     
     # Sanity checks
@@ -258,17 +301,68 @@ def parse_args():
     return args
 
 
+def evaluate_model(model, eval_dataloader, accelerator, metric, args, completed_steps, is_regression):
+    model.eval()
+    samples_seen = 0
+    for step, batch in enumerate(eval_dataloader):
+        with torch.no_grad():
+            outputs = model(**batch)
+        predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+        predictions, references = accelerator.gather((predictions, batch["labels"]))
+        # If we are in a multiprocess environment, the last batch has duplicates
+        if accelerator.num_processes > 1:
+            if step == len(eval_dataloader) - 1:
+                predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
+                references = references[: len(eval_dataloader.dataset) - samples_seen]
+            else:
+                samples_seen += references.shape[0]
+        metric.add_batch(
+            predictions=predictions,
+            references=references,
+        )
+
+    eval_metric = metric.compute()
+
+    if args.with_tracking:
+        accelerator.log(
+            {
+                "accuracy" if args.task_name is not None else "glue": eval_metric,
+                # "train_loss": total_loss.item() / len(train_dataloader),
+                # "epoch": epoch,
+                "step": completed_steps,
+            },
+            step=completed_steps,
+        )
+
+    wandb.log({
+            "accuracy" if args.task_name is not None else "glue": eval_metric,
+            # "train_loss": total_loss.item() / len(train_dataloader),
+            # "epoch": epoch,
+            "step": completed_steps,
+        },
+        step=completed_steps)
+
+    return eval_metric
+
+
 def main():
     args = parse_args()
+
+    # task_splits = args.task_name.split('/')
+    # sub_task_name = None
+    # if len(task_splits) > 2:
+    #     args.task_name = "/".join(task_splits[:2])
+    #     sub_task_name = task_splits[-1]
 
     run_name = args.task_name + "_" + args.architecture + "_lr_" + str(args.learning_rate)
     if args.architecture == "sow":
         run_name += "_r_" + str(args.rank) + "_d_" + str(args.n_iter) + "_acc_" + str(args.accumulation_steps)
 
-    wandb.init(
-        project="glue-"+args.task_name,
-        name=run_name
-    )
+    if not args.wandb_off:
+        wandb.init(
+            project="glue_"+args.task_name.split('/')[-1],
+            name=run_name
+        )
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -335,7 +429,13 @@ def main():
     # download the dataset.
     if args.task_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset("glue", args.task_name)
+        if args.task_name in task_to_keys.keys():
+            raw_datasets = load_dataset("glue", args.task_name)
+        else:
+            if args.task_split:
+                raw_datasets = load_dataset(args.task_name, args.task_split, trust_remote_code=True)
+            else:
+                raw_datasets = load_dataset(args.task_name, trust_remote_code=True)
     else:
         # Loading the dataset from local csv or json file.
         data_files = {}
@@ -352,7 +452,15 @@ def main():
     if args.task_name is not None:
         is_regression = args.task_name == "stsb"
         if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
+            if args.task_name in task_to_keys.keys():
+                label_list = raw_datasets["train"].features["label"].names
+            else:
+                label_value = raw_datasets["train"].features[more_task_to_labels[args.task_name]]
+                if label_value.dtype == 'bool':
+                    label_list = [0, 1]
+                else:
+                    print(label_value)
+                    label_list = label_value.names
             num_labels = len(label_list)
         else:
             num_labels = 1
@@ -391,32 +499,6 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
 
-        if "roberta" in args.model_name_or_path:
-            for p in model.roberta.parameters():
-                p.requires_grad = True
-            for p in model.classifier.parameters():
-                p.requires_grad = True
-        
-        def f():
-            for p in model.parameters():
-                if p.requires_grad: yield p
-        print(next(f()).data[:5, :5])
-
-        if args.architecture == "sow":
-            sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, scale=args.scale)
-
-            if "llama" in args.model_name_or_path:
-                target_modules = [
-                    "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj"
-                ]
-            elif "roberta" in args.model_name_or_path:
-                target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
-            logger.info("Preparing SoW model")
-            model = prepare_sow(model, target_modules, decompose=True, args=sow_args)
-            logger.info("SoW model prepared")
-
-            print(model)
     else:
         config = AutoConfig.from_pretrained(args.model_name_or_path)
         setattr(config, 'num_labels', num_labels)
@@ -426,6 +508,34 @@ def main():
         model = LlamaForSequenceClassification(
             config
         )
+
+    if args.architecture == "sow":
+        sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, scale=args.scale, init_method=args.init_method)
+
+        if "llama" in args.model_name_or_path:
+            target_modules = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"
+            ]
+        elif "roberta" in args.model_name_or_path:
+            target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
+        logger.info("Preparing SoW model")
+        model = prepare_sow(model, target_modules, decompose=args.mode, args=sow_args)
+        logger.info("SoW model prepared")
+
+        print(model)
+    elif args.architecure == "lora":
+        lora_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,  # Task type for sequence classification
+            inference_mode=False,       # Enable for training; set True for inference
+            r=args.lora_rank,                        # Rank of the adaptation matrices
+            lora_alpha=args.lora_alpha,              # LoRA scaling factor
+            lora_dropout=args.lora_dropout,           # Dropout probability for LoRA layers
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+
+    
     ## load pretrained model
     if args.load_pretrained_model:
         logger.info("*" * 40)
@@ -442,35 +552,23 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
         logger.info(f"Model successfully loaded (strict=False policy)")
         logger.info("*" * 40)
-        
-    # project modules
-    # if not args.lora_all_modules:
-    #     target_modules_list = ["q_proj", "v_proj"]
-    # else:
-    #     print('Enabling LoRA for all modules')
-    #     target_modules_list = ["q_proj", "v_proj", "up_proj", "down_proj", "gate_proj", "k_proj", "o_proj"]
-        
-    # other modules for bert-family modules
-    # if 'bert' in args.model_name_or_path:
-    #     if not args.lora_all_modules:
-    #         target_modules_list = ["query"]
-    #     else:
-    #         print('Enabling LoRA for all modules')
-    #         target_modules_list = ["query", "value", "key", "intermediate.dense", "output.dense"]
     
     # Preprocessing the datasets
     if args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[args.task_name]
+        if args.task_name in task_to_keys.keys():
+            sentence_keys = task_to_keys[args.task_name]
+        else:
+            sentence_keys = more_task_to_keys[args.task_name]
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
         non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
         if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
-            sentence1_key, sentence2_key = "sentence1", "sentence2"
+            sentence_keys = "sentence1", "sentence2"
         else:
             if len(non_label_column_names) >= 2:
-                sentence1_key, sentence2_key = non_label_column_names[:2]
+                sentence_keys = non_label_column_names[:2]
             else:
-                sentence1_key, sentence2_key = non_label_column_names[0], None
+                sentence_keys = non_label_column_names[0], None
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
@@ -505,20 +603,32 @@ def main():
 
     padding = "max_length" if args.pad_to_max_length else False
 
+    print(label_to_id)
+
     def preprocess_function(examples):
         # Tokenize the texts
-        texts = (
-            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
-        )
+        # texts = (
+        #     (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+        # )
+        texts = tuple([
+            more_task_to_process[args.task_name][sentence_key](examples[sentence_key])
+            if args.task_name in more_task_to_process and sentence_key in more_task_to_process[args.task_name]
+            else examples[sentence_key]
+            for sentence_key in sentence_keys
+        ])
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
 
-        if "label" in examples:
-            if label_to_id is not None:
-                # Map labels to IDs (not necessary for GLUE tasks)
-                result["labels"] = [label_to_id[l] for l in examples["label"]]
-            else:
-                # In all cases, rename the column to labels because the model will expect that.
-                result["labels"] = examples["label"]
+        for label in ["label"] + list(more_task_to_labels.values()):
+            if label in examples:
+                if label_to_id is not None:
+                    print(examples[label])
+                    # Map labels to IDs (not necessary for GLUE tasks)
+                    result["labels"] = [label_to_id[l] for l in examples[label]]
+                    #  if not isinstance(l, bool) else int(l)
+                else:
+                    # In all cases, rename the column to labels because the model will expect that.
+                    result["labels"] = examples[label]
+                break
         return result
 
     with accelerator.main_process_first():
@@ -568,14 +678,14 @@ def main():
                 continue
 
             for downscale_weight in module.downscale_weights:
-                special_params.append(downscale_weight)
+                if downscale_weight.requires_grad:
+                    special_params.append(downscale_weight)
             for upscale_weight in module.upscale_weights:
-                special_params.append(upscale_weight)
-            
+                if upscale_weight.requires_grad:
+                    special_params.append(upscale_weight)
+
         id_params = [id(p) for p in special_params]
         trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in id_params]
-        for n, _ in trainable_params:
-            print(n)
     elif args.architecture == "galore":
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -617,6 +727,9 @@ def main():
     logger.info("Total parameters: " + str(memory_usage))
     logger.info("Special parameters: " + str(memory_usage2))
     logger.info("Other trainable parameters: " + str(memory_usage3))
+
+    logger.info("Length train dataset: " + str(len(train_dataloader)))
+    logger.info("Length eval dataset: " + str(len(eval_dataloader)))
 
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
 
@@ -661,12 +774,17 @@ def main():
 
     # Get the metric function
     if args.task_name is not None:
-        metric = evaluate.load("glue", args.task_name)
+        if args.task_name in task_to_keys.keys():
+            metric = evaluate.load("glue", args.task_name)
+        else:
+            metric = evaluate.load("f1")
     else:
         metric = evaluate.load("accuracy")
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    memory_usage, memory_usage_sow, memory_usage_accum = calculate_weight_usage(model)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -675,6 +793,9 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
+    logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
+    
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
@@ -754,34 +875,34 @@ def main():
                 progress_bar.update(1)
                 completed_steps += 1
 
-                # def f():
-                #     for p in model.parameters():
-                #         if p.requires_grad: yield p
-                # print(next(f()).data[:5, :5])
 
-            if completed_steps > 0 and completed_steps % args.accumulation_steps == 0 and args.architecture == "sow":
-                logger.info(f"Accumulation & Reset optimizer states (step {completed_steps})")
-                accumulate(model)
+            if step % args.gradient_accumulation_steps == 0 and completed_steps > 0 and completed_steps % args.accumulation_steps == 0 and args.architecture == "sow":
+                logger.info(f"Accumulation, Scaling & Reset optimizer states (step {completed_steps})")
+                # accumulate(model)
+                scaling = 1/args.rank
+                for name, module in model.named_modules():
+                    if isinstance(module, SoWLinear):
+                        # export_alignment(module, name+"_"+str(completed_steps))
+                        module.accumulate()
+                        if completed_steps // args.accumulation_steps == 1:
+                            module.scale = scaling
+                logger.info(f"Subspace learning alignment saved + accumulation")
+                # if completed_steps // args.accumulation_steps == 1:
+                #     optimizer.param_groups[2]["lr"] *= scaling
+                #     optimizer.param_groups[2]["initial_lr"] *= scaling
 
-                group = optimizer.param_groups[2]
-                for param in group["params"]:
-                    state = optimizer.state[param]
-                    # Exponential moving average of gradient values
-                    state["exp_avg"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-                    # Exponential moving average of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(
-                        param, memory_format=torch.preserve_format
-                    )
-                    if group["amsgrad"]:
-                        # Maintains max of all exp. moving avg. of sq. grad. values
-                        state["max_exp_avg_sq"] = torch.zeros_like(
-                            param, memory_format=torch.preserve_format
-                        )
+                #     logger.info(f"Scaling parameter equals to " + str(scaling))
 
-                    state["step"] = torch.zeros_like(state["step"])
-
+                # optimizer.param_groups[0]["initial_lr"] = optimizer.param_groups[0]["lr"]
+                # optimizer.param_groups[1]["initial_lr"] = optimizer.param_groups[1]["lr"]
+                # lr_scheduler = get_scheduler(
+                #     name=args.lr_scheduler_type,
+                #     optimizer=optimizer,
+                #     num_warmup_steps=args.num_warmup_steps,
+                #     num_training_steps=args.max_train_steps - completed_steps,
+                # )
+                # lr_scheduler.step()
+                reset_optimizer(optimizer, group_id=2) # reset the second parameter group    
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
@@ -796,50 +917,16 @@ def main():
                 "sow_lr": optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else None
             }, step=completed_steps)
 
+            if completed_steps % args.eval_every == 0 and completed_steps > 0:
+                logger.info(f"Evaluation at step {completed_steps}")
+                eval_metric = evaluate_model(model, eval_dataloader, accelerator, metric, args, completed_steps, is_regression)
+                logger.info(f"Metric: {eval_metric}")
+
             if completed_steps >= args.max_train_steps:
                 break
-
-
-        model.eval()
-        samples_seen = 0
-        for step, batch in enumerate(eval_dataloader):
-            with torch.no_grad():
-                outputs = model(**batch)
-            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
-            predictions, references = accelerator.gather((predictions, batch["labels"]))
-            # If we are in a multiprocess environment, the last batch has duplicates
-            if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
-                    predictions = predictions[: len(eval_dataloader.dataset) - samples_seen]
-                    references = references[: len(eval_dataloader.dataset) - samples_seen]
-                else:
-                    samples_seen += references.shape[0]
-            metric.add_batch(
-                predictions=predictions,
-                references=references,
-            )
-
-        eval_metric = metric.compute()
+        
+        eval_metric = evaluate_model(model, eval_dataloader, accelerator, metric, args, completed_steps, is_regression)
         logger.info(f"epoch {epoch}: {eval_metric}")
-
-        if args.with_tracking:
-            accelerator.log(
-                {
-                    "accuracy" if args.task_name is not None else "glue": eval_metric,
-                    "train_loss": total_loss.item() / len(train_dataloader),
-                    "epoch": epoch,
-                    "step": completed_steps,
-                },
-                step=completed_steps,
-            )
-
-        wandb.log({
-                "accuracy" if args.task_name is not None else "glue": eval_metric,
-                "train_loss": total_loss.item() / len(train_dataloader),
-                "epoch": epoch,
-                "step": completed_steps,
-            },
-            step=completed_steps)
 
         if args.push_to_hub and epoch < args.num_train_epochs - 1:
             accelerator.wait_for_everyone()
