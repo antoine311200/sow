@@ -80,7 +80,7 @@ task_to_keys = {
 more_task_to_keys = {
     "google/boolq": ("question", "passage"),
     "allenai/winogrande": ("sentence", "option1", "option2"),
-    "ybisk/piqa": ("goat", "sol1", "sol2"),
+    "ybisk/piqa": ("goal", "sol1", "sol2"),
     "allenai/social_i_qa": ("context", "question", "answerA", "answerB", "answerC"),
     "allenai/openbookqa": ("question_stem", "choices"),
     "Rowan/hellaswag": ("activity_label", "ctx", "endings")
@@ -121,6 +121,12 @@ def parse_args():
         default=None,
         help="The name of the glue task to train on.",
         choices=list(task_to_keys.keys())+list(more_task_to_keys.keys()),
+    )
+    parser.add_argument(
+        "--task_split",
+        type=str,
+        default=None,
+        help="The name of the split task to train on.",
     )
     parser.add_argument(
         "--train_file", type=str, default=None, help="A csv or a json file containing the training data."
@@ -342,6 +348,12 @@ def evaluate_model(model, eval_dataloader, accelerator, metric, args, completed_
 def main():
     args = parse_args()
 
+    # task_splits = args.task_name.split('/')
+    # sub_task_name = None
+    # if len(task_splits) > 2:
+    #     args.task_name = "/".join(task_splits[:2])
+    #     sub_task_name = task_splits[-1]
+
     run_name = args.task_name + "_" + args.architecture + "_lr_" + str(args.learning_rate)
     if args.architecture == "sow":
         run_name += "_r_" + str(args.rank) + "_d_" + str(args.n_iter) + "_acc_" + str(args.accumulation_steps)
@@ -420,7 +432,10 @@ def main():
         if args.task_name in task_to_keys.keys():
             raw_datasets = load_dataset("glue", args.task_name)
         else:
-            raw_datasets = load_dataset(args.task_name)
+            if args.task_split:
+                raw_datasets = load_dataset(args.task_name, args.task_split, trust_remote_code=True)
+            else:
+                raw_datasets = load_dataset(args.task_name, trust_remote_code=True)
     else:
         # Loading the dataset from local csv or json file.
         data_files = {}
@@ -444,6 +459,7 @@ def main():
                 if label_value.dtype == 'bool':
                     label_list = [0, 1]
                 else:
+                    print(label_value)
                     label_list = label_value.names
             num_labels = len(label_list)
         else:
@@ -575,7 +591,7 @@ def main():
                 f"model labels: {sorted(label_name_to_id.keys())}, dataset labels: {sorted(label_list)}."
                 "\nIgnoring the model labels as a result.",
             )
-    elif not is_regression:
+    elif args.task_name is None and not is_regression:
         label_to_id = {v: i for i, v in enumerate(label_list)}
 
     if label_to_id is not None:
@@ -587,14 +603,16 @@ def main():
 
     padding = "max_length" if args.pad_to_max_length else False
 
+    print(label_to_id)
+
     def preprocess_function(examples):
         # Tokenize the texts
         # texts = (
         #     (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         # )
-        texts = flatten_list([
+        texts = tuple([
             more_task_to_process[args.task_name][sentence_key](examples[sentence_key])
-            if sentence_key in more_task_to_process[args.task_name]
+            if args.task_name in more_task_to_process and sentence_key in more_task_to_process[args.task_name]
             else examples[sentence_key]
             for sentence_key in sentence_keys
         ])
@@ -603,8 +621,10 @@ def main():
         for label in ["label"] + list(more_task_to_labels.values()):
             if label in examples:
                 if label_to_id is not None:
+                    print(examples[label])
                     # Map labels to IDs (not necessary for GLUE tasks)
-                    result["labels"] = [label_to_id[int(l)] for l in examples[label]]
+                    result["labels"] = [label_to_id[l] for l in examples[label]]
+                    #  if not isinstance(l, bool) else int(l)
                 else:
                     # In all cases, rename the column to labels because the model will expect that.
                     result["labels"] = examples[label]

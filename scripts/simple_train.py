@@ -376,14 +376,6 @@ def main(args):
         else:
             logger.warning(f"Did not find training state in {args.continue_from}, global step will start from zero")
         logger.info("*" * 40)
-    
-
-    import sys
-    import time
-    for batch in dataloader:
-        model(batch).loss.backward()
-        time.sleep(20000000)
-        sys.exit()
 
 
     special_params = []
