@@ -352,6 +352,7 @@ def main(args):
         checkpoint_path = os.path.join(args.continue_from, "model.safetensors")
 
         if args.architecture == "sow":
+            # Need to check wether we load a non-SoW pretrained model or a statedict of a SoW model 
             load_sow(model, checkpoint_path)
         else:
             load_model(model, checkpoint_path)

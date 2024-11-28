@@ -21,13 +21,14 @@ class SoWArgs:
     n_iter: int = 5
     scale: float = 1
 
+
 class SoWParameter(nn.ParameterList):
 
     def __init__(
         self,
         in_features: int,
         out_features: int,
-        n_iter: int = 5,
+        n_iter: int = 1,
         device=None,
         dtype=None,
     ) -> None:
@@ -38,18 +39,17 @@ class SoWParameter(nn.ParameterList):
                 for _ in range(n_iter)
             ]
         )
+
         self.in_features = in_features
         self.out_features = out_features
         self.n_iter = n_iter
-
-        self.shape = (self.n_iter, self.in_features, self.out_features)
 
     def from_weights(self, weights: List[torch.Tensor]) -> None:
         for i, weight in enumerate(weights):
             self[i].data = weight.data
 
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}({self.in_features}, {self.out_features}, n_iter={self.n_iter})"
+    def extra_repr(self) -> str:
+        return f"{self.n_iter} x ({self.in_features}, {self.out_features})"
 
 
 class SoWLinear(nn.Module):
@@ -105,8 +105,8 @@ class SoWLinear(nn.Module):
                 if self.init_method == "normal_QR":
                     nn.init.normal_(weight, mean=0.0, std=0.02) # hardcoded value std=0.02 from Llama config
                     q_weight, r_weight = qr_weight(weight, self.rank)
-                    self.downscale_weights[i] = q_weight.to(self.downscale_weights[i].device).contiguous()
-                    self.upscale_weights[i] = r_weight.to(self.upscale_weights[i].device).contiguous()
+                    self.downscale_weights[i] = q_weight.to(self.downscale_weights[i].device).type(self.downscale_weights[i].dtype).contiguous()
+                    self.upscale_weights[i] = r_weight.to(self.upscale_weights[i].device).type(self.upscale_weights[i].dtype).contiguous()
                 else:
                     nn.init.normal_(self.downscale_weights[i], std=0.02)
                     nn.init.normal_(self.upscale_weights[i], std=0.02)

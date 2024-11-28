@@ -53,6 +53,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 from tn_gradient.layer.sow import SoWLinear, SoWArgs
 from tn_gradient.prepare import prepare_sow, accumulate, export_alignment
+from tn_gradient.utils import __colorized_str__
+torch.nn.Module.__str__ = __colorized_str__
 
 from utils.training_utils import reset_optimizer
 from utils.memory_utils import calculate_weight_usage
@@ -83,7 +85,9 @@ more_task_to_keys = {
     "ybisk/piqa": ("goal", "sol1", "sol2"),
     "allenai/social_i_qa": ("context", "question", "answerA", "answerB", "answerC"),
     "allenai/openbookqa": ("question_stem", "choices"),
-    "Rowan/hellaswag": ("activity_label", "ctx", "endings")
+    "Rowan/hellaswag": ("activity_label", "ctx", "endings"),
+    "allenai/ai2_arc": ("question", "choices")
+    # "truthfulqa/truthful_qa": ("question", )
 }
 more_task_to_labels = {
     "google/boolq": "answer",
@@ -91,10 +95,12 @@ more_task_to_labels = {
     "ybisk/piqa": "label",
     "allenai/social_i_qa": "label",
     "allenai/openbookqa": "answerKey",
-    "Rowan/hellaswag": "label"
+    "Rowan/hellaswag": "label",
+    "allenai/ai2_arc": "answerKey",
 }
 more_task_to_process = {
     "allenai/openbookqa": { "choices": lambda x: x["text"]},
+    "allenai/ai2_arc": { "choices": lambda x: x["text"]},
     # "Rowan/hellaswag": { "endings": lambda x: x},
 }
 
@@ -250,6 +256,16 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument(
+        "--quantization",
+        action="store_true",
+        help="Wether or not to use quantization",
+    )
+    parser.add_argument(
+        "--activation_checkpointing",
+        action="store_true",
+        help="Wether or not to use activation checkpointing",
+    )
     
     # support enable_galore
     # parser.add_argument("--enable_galore", action="store_true", help="Whether or not to use low rank optimizer.")
@@ -347,12 +363,6 @@ def evaluate_model(model, eval_dataloader, accelerator, metric, args, completed_
 
 def main():
     args = parse_args()
-
-    # task_splits = args.task_name.split('/')
-    # sub_task_name = None
-    # if len(task_splits) > 2:
-    #     args.task_name = "/".join(task_splits[:2])
-    #     sub_task_name = task_splits[-1]
 
     run_name = args.task_name + "_" + args.architecture + "_lr_" + str(args.learning_rate)
     if args.architecture == "sow":
@@ -456,6 +466,9 @@ def main():
                 label_list = raw_datasets["train"].features["label"].names
             else:
                 label_value = raw_datasets["train"].features[more_task_to_labels[args.task_name]]
+                print("\n\n\n")
+                print(label_value)
+                print("\n\n\n")
                 if label_value.dtype == 'bool':
                     label_list = [0, 1]
                 else:
@@ -481,13 +494,13 @@ def main():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
+    config = AutoConfig.from_pretrained(
+        args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=args.task_name,
+        trust_remote_code=args.trust_remote_code,
+    )
     if not args.eval_llama:
-        config = AutoConfig.from_pretrained(
-            args.model_name_or_path,
-            num_labels=num_labels,
-            finetuning_task=args.task_name,
-            trust_remote_code=args.trust_remote_code,
-        )
         tokenizer = AutoTokenizer.from_pretrained(
             args.model_name_or_path, use_fast=not args.use_slow_tokenizer, trust_remote_code=args.trust_remote_code
         )
@@ -498,16 +511,53 @@ def main():
             ignore_mismatched_sizes=args.ignore_mismatched_sizes,
             trust_remote_code=args.trust_remote_code,
         )
-
+        for param in model.roberta.parameters():
+            param.requires_grad = False
     else:
-        config = AutoConfig.from_pretrained(args.model_name_or_path)
         setattr(config, 'num_labels', num_labels)
         setattr(config, 'finetuning_task', args.task_name)
-        tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
-        tokenizer.padding_side = "left"
-        model = LlamaForSequenceClassification(
-            config
-        )
+        setattr(config, 'pad_token_id', -1)
+
+        if not os.path.exists(args.model_name_or_path):
+            if args.quantization:
+                model = LlamaForSequenceClassification.from_pretrained(
+                    args.model_name_or_path,
+                    config=config,
+                    load_in_8bit=True,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            else:
+                model = LlamaForSequenceClassification.from_pretrained(
+                    args.model_name_or_path,
+                    config=config,
+                    # device_map="auto",
+                    ignore_mismatched_sizes=args.ignore_mismatched_sizes,
+                    trust_remote_code=args.trust_remote_code,
+                )
+            tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+            # tokenizer.add_eos_token = True
+            # tokenizer.pad_token_id = -1
+            # tokenizer.padding_side = "left"
+            tokenizer.padding_side = "left"
+            tokenizer.pad_token = tokenizer.eos_token
+            for param in model.base_model.parameters():
+                param.requires_grad = False
+        else:
+            tokenizer = AutoTokenizer.from_pretrained("t5-base", model_max_length=args.max_length)
+            model = LlamaForSequenceClassification(config)
+            for param in model.base_model.parameters():
+                param.requires_grad = False
+    
+    ####################################################################################################
+    ####################################################################################################
+    #######################                      Prepare SoW                     #######################
+    ####################################################################################################
+    ####################################################################################################
+
+
 
     if args.architecture == "sow":
         sow_args = SoWArgs(rank=args.rank, n_iter=args.n_iter, device=device, dtype=model.dtype, scale=args.scale, init_method=args.init_method)
@@ -524,7 +574,7 @@ def main():
         logger.info("SoW model prepared")
 
         print(model)
-    elif args.architecure == "lora":
+    elif args.architecture == "lora":
         lora_config = LoraConfig(
             task_type=TaskType.SEQ_CLS,  # Task type for sequence classification
             inference_mode=False,       # Enable for training; set True for inference
@@ -552,13 +602,31 @@ def main():
         model.load_state_dict(checkpoint, strict=False)
         logger.info(f"Model successfully loaded (strict=False policy)")
         logger.info("*" * 40)
-    
+
+
+
+
+
+
+
+
+
+
+    ####################################################################################################
+    ####################################################################################################
+    #######################                 Dataset Preprocessing                #######################
+    ####################################################################################################
+    ####################################################################################################
+
+
     # Preprocessing the datasets
     if args.task_name is not None:
         if args.task_name in task_to_keys.keys():
             sentence_keys = task_to_keys[args.task_name]
         else:
             sentence_keys = more_task_to_keys[args.task_name]
+        
+        # sentence1_key, sentence2_key = task_to_keys[args.task_name][0], None if len(task_to_keys[args.task_name])==1 else task_to_keys[args.task_name][1]
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
         non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
@@ -572,6 +640,7 @@ def main():
 
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
+    print(args.task_name is None and not is_regression, args.task_name, is_regression)
     if (
         model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
         and args.task_name is not None
@@ -593,6 +662,9 @@ def main():
             )
     elif args.task_name is None and not is_regression:
         label_to_id = {v: i for i, v in enumerate(label_list)}
+    else:
+        label_to_id = {v: i for i, v in enumerate(label_list)}
+        print(label_to_id)
 
     if label_to_id is not None:
         model.config.label2id = label_to_id
@@ -602,7 +674,6 @@ def main():
         model.config.id2label = {id: label for label, id in config.label2id.items()}
 
     padding = "max_length" if args.pad_to_max_length else False
-
     print(label_to_id)
 
     def preprocess_function(examples):
@@ -621,7 +692,7 @@ def main():
         for label in ["label"] + list(more_task_to_labels.values()):
             if label in examples:
                 if label_to_id is not None:
-                    print(examples[label])
+                    # print(examples[label])
                     # Map labels to IDs (not necessary for GLUE tasks)
                     result["labels"] = [label_to_id[l] for l in examples[label]]
                     #  if not isinstance(l, bool) else int(l)
@@ -661,6 +732,7 @@ def main():
         train_dataset, shuffle=True, collate_fn=data_collator, batch_size=args.per_device_train_batch_size
     )
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+
 
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -719,6 +791,7 @@ def main():
     ]
 
     memory_usage = sum(p.numel() for p in model.parameters())
+    memory_usage_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     memory_usage2 = sum(p.numel() for p in special_params)
     memory_usage3 = sum(p.numel() for _, p in trainable_params)
     # for n, p in model.named_parameters():
@@ -727,6 +800,7 @@ def main():
     logger.info("Total parameters: " + str(memory_usage))
     logger.info("Special parameters: " + str(memory_usage2))
     logger.info("Other trainable parameters: " + str(memory_usage3))
+    logger.info("Trainable parameters: " + str(memory_usage_trainable))
 
     logger.info("Length train dataset: " + str(len(train_dataloader)))
     logger.info("Length eval dataset: " + str(len(eval_dataloader)))
@@ -764,6 +838,7 @@ def main():
     if checkpointing_steps is not None and checkpointing_steps.isdigit():
         checkpointing_steps = int(checkpointing_steps)
 
+
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if args.with_tracking:
@@ -777,9 +852,17 @@ def main():
         if args.task_name in task_to_keys.keys():
             metric = evaluate.load("glue", args.task_name)
         else:
-            metric = evaluate.load("f1")
+            metric = evaluate.load("accuracy") # f1
     else:
         metric = evaluate.load("accuracy")
+
+
+    logger.info(f"Initial evaluation: {eval_metric}")
+    eval_metric = evaluate_model(model, eval_dataloader, accelerator, metric, args, 0, is_regression)
+    logger.info(f"Metric: {eval_metric}")
+
+    # import sys
+    # sys.exit()
 
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -840,6 +923,8 @@ def main():
 
 
 
+    if args.activation_checkpointing:
+        model.gradient_checkpointing_enable()
 
     # update the progress_bar if load from checkpoint
     progress_bar.update(completed_steps)
