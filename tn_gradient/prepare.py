@@ -52,83 +52,95 @@ def prepare_sow(
                     return True
         return False
 
+    length = 0
     for name, module in model.named_modules():
         if check_module(name, module):
-            layers_to_replace[name] = module
+            # layers_to_replace[name] = module
+            length += 1
 
-    pbar = tqdm(total=len(layers_to_replace.items()), desc="Prepare model", ncols=50)
+    pbar = tqdm(total=length, desc="Prepare model", ncols=50)
 
-    for name, module in layers_to_replace.items():
-        # # Convertion to float is necessary for the QR decomposition
-        # # as CUDA does not support QR decomposition for half precision
-        convertion = False
-        if module.weight.data.dtype != torch.float:
-            convertion = True
+    # for name, module in layers_to_replace.items():
+    
+    for name, module in model.named_modules():
+        if check_module(name, module):
+            # # Convertion to float is necessary for the QR decomposition
+            # # as CUDA does not support QR decomposition for half precision
+            convertion = False
+            if module.weight.data.dtype != torch.float:
+                convertion = True
 
-            weight_type = module.weight.data.dtype
-            weight_device = module.weight.data.device
-            module.weight = module.weight.to(torch.float)
+                weight_type = module.weight.data.dtype
+                weight_device = module.weight.data.device
+                module.weight = module.weight.to(torch.float)
 
-        # Create a blank Sum-of-Weights layer
-        new_layer = SoWLinear(
-            in_features=module.in_features,
-            out_features=module.out_features,
-            rank=args.rank,
-            n_iter=args.n_iter,
-            scale=args.scale,
-            init_method=args.init_method,
-            bias=module.bias is not None,
-            dtype=module.weight.data.dtype,
-            device=args.device,
-            init_params=decompose!='qr'
-        )
-        new_layer.virtual_rank = min(module.in_features, module.out_features)
-
-        if decompose == 'qr':
-            keep_rank = args.rank * args.n_iter
-            Q, R = torch.linalg.qr(module.weight.data.T.to("cuda"))
-            Q_major, Q_minor = (
-                Q[:, :-keep_rank],
-                Q[:, -keep_rank:],
+            # Create a blank Sum-of-Weights layer
+            new_layer = SoWLinear(
+                in_features=module.in_features,
+                out_features=module.out_features,
+                rank=args.rank,
+                n_iter=args.n_iter,
+                scale=args.scale,
+                init_method=args.init_method,
+                bias=module.bias is not None,
+                dtype=module.weight.data.dtype,
+                device=args.device,
+                init_params=decompose!='qr'
             )
-            R_major, R_minor = (
-                R[:-keep_rank, :],
-                R[-keep_rank:, :],
-            )
+            new_layer.virtual_rank = min(module.in_features, module.out_features)
 
-            W = Q_major @ R_major
-            W = Q_major @ R_major
-            A = torch.split(Q_minor, args.rank, dim=1)
-            B = torch.split(R_minor, args.rank, dim=0)
+            if decompose == 'qr':
+                keep_rank = args.rank * args.n_iter
+                Q, R = torch.linalg.qr(module.weight.data.T.to("cuda"))
+                Q_major, Q_minor = (
+                    Q[:, :-keep_rank],
+                    Q[:, -keep_rank:],
+                )
+                R_major, R_minor = (
+                    R[:-keep_rank, :],
+                    R[-keep_rank:, :],
+                )
 
-            new_layer.downscale_weights.from_weights(A)
-            new_layer.upscale_weights.from_weights(B)
-            # new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
-            new_layer.acc_downweight = nn.Parameter(W.to(args.device).contiguous(), requires_grad=False)
+                W = Q_major @ R_major
+                W = Q_major @ R_major
+                A = torch.split(Q_minor, args.rank, dim=1)
+                B = torch.split(R_minor, args.rank, dim=0)
 
-            for up_weight in new_layer.upscale_weights:
-                up_weight.require_grad = True
-            for down_weight in new_layer.downscale_weights:
-                down_weight.require_grad = True
-        elif decompose == 'keep':
-            new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
+                new_layer.downscale_weights.from_weights(A)
+                new_layer.upscale_weights.from_weights(B)
+                # new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
+                new_layer.acc_downweight = nn.Parameter(W.to(args.device).contiguous(), requires_grad=False)
 
-        if module.bias is not None:
-            new_layer.bias = module.bias
+                for up_weight in new_layer.upscale_weights:
+                    up_weight.require_grad = True
+                for down_weight in new_layer.downscale_weights:
+                    down_weight.require_grad = True
+            elif decompose == 'keep':
+                new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
 
-        if convertion:
-            new_layer.acc_downweight.to(weight_device).type(weight_type)
-            new_layer.downscale_weights.to(weight_device).type(weight_type)
-            new_layer.upscale_weights.to(weight_device).type(weight_type)
+            if module.bias is not None:
+                new_layer.bias = module.bias
 
-        if "." in name:
-            parent_name, child_name = name.rsplit(".", 1)
-            parent_module = dict(model.named_modules())[parent_name]
-            setattr(parent_module, child_name, new_layer)
-        else:
-            setattr(model, name, new_layer)
-        
-        pbar.update(1)
+            if convertion:
+                # for i in range(len(new_layer.downscale_weights)):
+                #     new_layer.downscale_weights[i].to(weight_device).type(weight_type)
+                #     new_layer.upscale_weights[i].to(weight_device).type(weight_type)
+                new_layer.acc_downweight.to(weight_device).type(weight_type)
+                new_layer.downscale_weights.to(weight_device).type(weight_type)
+                new_layer.upscale_weights.to(weight_device).type(weight_type)
+            
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent_module = dict(model.named_modules())[parent_name]
+                setattr(parent_module, child_name, new_layer)
+            else:
+                setattr(model, name, new_layer)
+            
+            module.to("cpu")
+            del module
+            torch.cuda.empty_cache()
+            
+            pbar.update(1)
 
     return model
 

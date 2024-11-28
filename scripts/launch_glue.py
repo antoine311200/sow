@@ -39,21 +39,23 @@ def run_glue(rank, acc, lr, sow_lr, gpu_id):
         f"--model_name_or_path roberta-base "
         # f"--model_name_or_path huggyllama/llama-7b "
         # f"--eval_llama "
+        # f"--activation_checkpointing "
+        # f"--quantization "
         f"--task_name google/boolq "
+        # f"--task_split winogrande_m "
         f"--max_length 512 "
         f"--seed=4321 "
         f"--per_device_train_batch_size 16 "
-        f"--learning_rate {lr} "
-        f"--sow_lr {sow_lr} "
         f"--num_train_epochs 30 "
         f"--eval_every 4000 "
+        f"--learning_rate {lr} "
+
         f"--architecture sow "
+        f"--sow_lr {sow_lr} "
         f"--rank {rank} "
-        f"--init_method normal_QR "
         f"--mode keep "
-        f"--scale 1 "
         f"--accumulation_steps {acc} "
-        f"--output_dir results/ft/roberta_base/google-boolq"
+        f"--output_dir results/ft/roberta_base/misc"
     )
     os.system(command)
 
@@ -73,13 +75,13 @@ def worker(job_queue, gpu_id):
 
 if __name__ == "__main__":
     # Define GPU IDs
-    gpu_ids = [2]#3, 6, 7, 8]
+    gpu_ids = [7]#5, 6, 7, 8]
     
     # Define parameter combinations
     ranks = [20]
     accs = [4000]  # Example multiple values
-    lrs = [5e-6]
-    sow_lrs = [7.5e-5]
+    lrs = [1e-6]#[5e-6, 1e-6,  1e-5]
+    sow_lrs = [7.5e-5]#[1.5e-6, 2.5e-5]
     param_combinations = list(product(ranks, accs, lrs, sow_lrs))
     
     # Create a job queue
