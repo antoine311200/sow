@@ -53,8 +53,8 @@ from peft import LoraConfig, get_peft_model, TaskType
 
 from tn_gradient.layer.sow import SoWLinear, SoWArgs
 from tn_gradient.prepare import prepare_sow, accumulate, export_alignment
-from tn_gradient.utils import __colorized_str__
-torch.nn.Module.__str__ = __colorized_str__
+# from tn_gradient.utils import __colorized_str__
+# torch.nn.Module.__str__ = __colorized_str__
 
 from utils.training_utils import reset_optimizer
 from utils.memory_utils import calculate_weight_usage
@@ -90,13 +90,13 @@ more_task_to_keys = {
     # "truthfulqa/truthful_qa": ("question", )
 }
 more_task_to_labels = {
-    "google/boolq": "answer",
-    "allenai/winogrande": "answer",
-    "ybisk/piqa": "label",
-    "allenai/social_i_qa": "label",
-    "allenai/openbookqa": "answerKey",
-    "Rowan/hellaswag": "label",
-    "allenai/ai2_arc": "answerKey",
+    "google/boolq": ("answer", None),
+    "allenai/winogrande": ("answer", None),
+    "ybisk/piqa": ("label", None),
+    "allenai/social_i_qa": ("label", ["1", "2", "3"]),
+    "allenai/openbookqa": ("answerKey", None),
+    "Rowan/hellaswag": ("label", None),
+    "allenai/ai2_arc": ("answerKey", None),
 }
 more_task_to_process = {
     "allenai/openbookqa": { "choices": lambda x: x["text"]},
@@ -465,14 +465,13 @@ def main():
             if args.task_name in task_to_keys.keys():
                 label_list = raw_datasets["train"].features["label"].names
             else:
-                label_value = raw_datasets["train"].features[more_task_to_labels[args.task_name]]
-                print("\n\n\n")
-                print(label_value)
-                print("\n\n\n")
-                if label_value.dtype == 'bool':
+                label_value = raw_datasets["train"].features[more_task_to_labels[args.task_name][0]]
+                if more_task_to_labels[args.task_name][1] is not None:
+                    label_list = more_task_to_labels[args.task_name][1]
+                    # print(label_list)
+                elif label_value.dtype == 'bool':
                     label_list = [0, 1]
                 else:
-                    print(label_value)
                     label_list = label_value.names
             num_labels = len(label_list)
         else:
@@ -662,7 +661,7 @@ def main():
             )
     elif args.task_name is None and not is_regression:
         label_to_id = {v: i for i, v in enumerate(label_list)}
-    else:
+    elif args.task_name not in task_to_keys:
         label_to_id = {v: i for i, v in enumerate(label_list)}
         print(label_to_id)
 
@@ -681,20 +680,36 @@ def main():
         # texts = (
         #     (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         # )
-        texts = tuple([
-            more_task_to_process[args.task_name][sentence_key](examples[sentence_key])
-            if args.task_name in more_task_to_process and sentence_key in more_task_to_process[args.task_name]
-            else examples[sentence_key]
-            for sentence_key in sentence_keys
-        ])
-        result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
+        # texts = tuple([
+        #     # more_task_to_process[args.task_name][sentence_key](examples[sentence_key])
+        #     # if args.task_name in more_task_to_process and sentence_key in more_task_to_process[args.task_name]
+        #     # else 
+        #     examples[sentence_key]
+        #     for sentence_key in sentence_keys
+        # ])
+        texts = [
+            "".join([
+                "<s>"+sentence_key+": "+
+                (
+                    more_task_to_process[args.task_name][sentence_key](examples[sentence_key][i]) 
+                    if args.task_name in more_task_to_process and sentence_key in more_task_to_process[args.task_name]
+                    else examples[sentence_key][i]
+                ) + "</s>"
+                for sentence_key in sentence_keys
+            ])[3:-4]
+            for i in range(len(examples[sentence_keys[0]]))
+        ]
 
-        for label in ["label"] + list(more_task_to_labels.values()):
-            if label in examples:
+        result = tokenizer(texts, padding=padding, max_length=args.max_length, truncation=True)
+        for label in ["label"] + list([label for label, _ in more_task_to_labels.values()]):
+            if label in examples and -1 not in examples[label]:
                 if label_to_id is not None:
                     # print(examples[label])
                     # Map labels to IDs (not necessary for GLUE tasks)
-                    result["labels"] = [label_to_id[l] for l in examples[label]]
+                    try:
+                        result["labels"] = [label_to_id[l] for l in examples[label]]
+                    except:
+                        result["labels"] = [label_to_id[str(l)] for l in examples[label]]
                     #  if not isinstance(l, bool) else int(l)
                 else:
                     # In all cases, rename the column to labels because the model will expect that.
@@ -857,9 +872,9 @@ def main():
         metric = evaluate.load("accuracy")
 
 
-    logger.info(f"Initial evaluation: {eval_metric}")
-    eval_metric = evaluate_model(model, eval_dataloader, accelerator, metric, args, 0, is_regression)
-    logger.info(f"Metric: {eval_metric}")
+    # logger.info(f"Initial evaluation")
+    # eval_metric = evaluate_model(model, eval_dataloader, accelerator, metric, args, 0, is_regression)
+    # logger.info(f"Metric: {eval_metric}")
 
     # import sys
     # sys.exit()
@@ -867,7 +882,7 @@ def main():
     # Train!
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    memory_usage, memory_usage_sow, memory_usage_accum = calculate_weight_usage(model)
+    # memory_usage, memory_usage_sow, memory_usage_accum = calculate_weight_usage(model)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -876,8 +891,20 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+
+    
+    memory_usage, memory_usage_sow, memory_usage_accum, memory_buffer = calculate_weight_usage(model)
+    memory_train_usage = sum(p.nelement() * p.element_size() for p in model.parameters() if p.requires_grad)
+
+    logger.info(f"\n{model}\n")
     logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
     logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
+    logger.info(f"Trainable params: {memory_train_usage / (1024 * 1024):.2f}MiB")
+    logger.info(f"Buffer params: {memory_buffer / (1024 * 1024):.2f}MiB")
+    if args.architecture == "sow":
+        logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
+    # logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
+    # logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
     
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -963,31 +990,16 @@ def main():
 
             if step % args.gradient_accumulation_steps == 0 and completed_steps > 0 and completed_steps % args.accumulation_steps == 0 and args.architecture == "sow":
                 logger.info(f"Accumulation, Scaling & Reset optimizer states (step {completed_steps})")
-                # accumulate(model)
+
                 scaling = 1/args.rank
                 for name, module in model.named_modules():
                     if isinstance(module, SoWLinear):
-                        # export_alignment(module, name+"_"+str(completed_steps))
                         module.accumulate()
                         if completed_steps // args.accumulation_steps == 1:
                             module.scale = scaling
-                logger.info(f"Subspace learning alignment saved + accumulation")
-                # if completed_steps // args.accumulation_steps == 1:
-                #     optimizer.param_groups[2]["lr"] *= scaling
-                #     optimizer.param_groups[2]["initial_lr"] *= scaling
-
-                #     logger.info(f"Scaling parameter equals to " + str(scaling))
-
-                # optimizer.param_groups[0]["initial_lr"] = optimizer.param_groups[0]["lr"]
-                # optimizer.param_groups[1]["initial_lr"] = optimizer.param_groups[1]["lr"]
-                # lr_scheduler = get_scheduler(
-                #     name=args.lr_scheduler_type,
-                #     optimizer=optimizer,
-                #     num_warmup_steps=args.num_warmup_steps,
-                #     num_training_steps=args.max_train_steps - completed_steps,
-                # )
-                # lr_scheduler.step()
                 reset_optimizer(optimizer, group_id=2) # reset the second parameter group    
+                
+
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
