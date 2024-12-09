@@ -67,12 +67,12 @@ def prepare_sow(
             # # Convertion to float is necessary for the QR decomposition
             # # as CUDA does not support QR decomposition for half precision
             convertion = False
-            if module.weight.data.dtype != torch.float:
+            if module.weight.data.dtype != torch.float and decompose == "qr":
                 convertion = True
 
                 weight_type = module.weight.data.dtype
                 weight_device = module.weight.data.device
-                module.weight = module.weight.to(torch.float)
+                # module.weight = nn.Parameter(module.weight.to(torch.float), requires_grad=False) 
 
             # Create a blank Sum-of-Weights layer
             new_layer = SoWLinear(
@@ -122,9 +122,6 @@ def prepare_sow(
                 new_layer.bias = module.bias
 
             if convertion:
-                # for i in range(len(new_layer.downscale_weights)):
-                #     new_layer.downscale_weights[i].to(weight_device).type(weight_type)
-                #     new_layer.upscale_weights[i].to(weight_device).type(weight_type)
                 new_layer.acc_downweight.to(weight_device).type(weight_type)
                 new_layer.downscale_weights.to(weight_device).type(weight_type)
                 new_layer.upscale_weights.to(weight_device).type(weight_type)

@@ -57,3 +57,5 @@ checkpoints
 *.pickle
 scripts/results
 scripts/data
+scripts/trained_models
+scripts/experiment

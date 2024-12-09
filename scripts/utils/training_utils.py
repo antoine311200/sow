@@ -273,5 +273,6 @@ def reset_optimizer(optimizer, group_id):
                 param, memory_format=torch.preserve_format
             )
 
-        state["step"] = torch.zeros_like(state["step"])
+        if "step" in state:
+            state["step"] = torch.zeros_like(state["step"])
 

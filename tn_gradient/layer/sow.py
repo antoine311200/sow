@@ -60,7 +60,7 @@ class SoWLinear(nn.Module):
         out_features: int,
         bias: bool = True,
         rank: int = 16,
-        n_iter: int = 5,
+        n_iter: int = 1,
         scale: float = 1,
         init_method: str = "normal_QR",
         device=None,
@@ -159,7 +159,7 @@ class SoWLinear(nn.Module):
             
             self.virtual_rank = min(self.virtual_rank + self.rank * self.n_iter, self.in_features, self.out_features)
         else:
-            self.acc_downweight = nn.Parameter(accumalation, requires_grad=False)
+            self.acc_downweight = nn.Parameter(accumalation.contiguous(), requires_grad=False)
             self.acc_upweight = nn.Parameter(torch.empty(0), requires_grad=False)
 
         torch.cuda.empty_cache()
