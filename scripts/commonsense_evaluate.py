@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import argparse
+from dataclasses import dataclass, field
 
 import fire
 
@@ -13,8 +14,18 @@ sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer, AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import TrainingArguments
+from safetensors.torch import load_file
 
-from tn_gradient.prepare import prepare_sow
+from tn_gradient.prepare import prepare_sow, SoWConfig
+
+@dataclass
+class SoWTrainingArguments(TrainingArguments):
+    rank: int = 10,
+    accumulation_steps: int = 1000,
+    sow_lr: float = 2e-4,
+    target_modules: list = field(default_factory=list)
+
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -27,6 +38,14 @@ try:
 except:  # noqa: E722
     pass
 
+def load_and_merge_safetensors(folder_path):
+    merged_state_dict = {}
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith(".safetensors"):
+            file_path = os.path.join(folder_path, file_name)
+            part_state_dict = load_file(file_path)
+            merged_state_dict.update(part_state_dict)
+    return merged_state_dict
 
 def main(
         load_8bit: bool = False,
@@ -219,23 +238,32 @@ def load_model(args) -> tuple:
         0  # unk. we want this to be different from the eos token
     )
     if device == "cuda":
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model,
-            load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            trust_remote_code=True,
-        ) # fix zwq
         if lora_weights:
+            model = AutoModelForCausalLM.from_pretrained(
+                base_model,
+                load_in_8bit=load_8bit,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+            ) # fix zwq
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
                 torch_dtype=torch.float16,
                 device_map={"":0}
             )
-        # else:
-        #     sow_args = 
-        #     model = prepare_sow(model, target_modules, decompose="keep", args=sow_args)
+        else:
+            config = AutoConfig.from_pretrained(base_model)
+            model = AutoModelForCausalLM.from_config(config)
+            args = torch.load(os.path.join(base_model, "training_args.bin"))
+            sow_config = SoWConfig(
+                target_modules=args.target_modules,
+                rank=args.rank,
+                device="cuda"
+            )
+            model = prepare_sow(model, sow_config)
+            model.load_state_dict(load_and_merge_safetensors(base_model))
+            print("Loaded")
         # print(model)
     elif device == "mps":
         model = AutoModelForCausalLM.from_pretrained(

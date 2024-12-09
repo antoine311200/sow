@@ -28,8 +28,8 @@ from peft import (  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, AutoModel, get_scheduler  # noqa: F402
 
 
-from tn_gradient.layer.sow import SoWLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow
+from tn_gradient.layer.sow import SoWLinear
+from tn_gradient.prepare import prepare_sow, SoWConfig
 from utils.training_utils import reset_optimizer
 
 from torchcolor.printer import Printer
@@ -62,45 +62,6 @@ class SoWTrainer(transformers.Trainer):
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
-    # def create_optimizer(self):
-    #     no_decay = ["bias", "LayerNorm.weight"]
-    #     special_params = []
-    #     for module_name, module in self.model.named_modules():
-    #         if not isinstance(module, SoWLinear):
-    #             continue
-
-    #         if not any(target_key in module_name for target_key in self.args.target_modules):
-    #             continue
-
-    #         for downscale_weight in module.downscale_weights:
-    #             if downscale_weight.requires_grad:
-    #                 special_params.append(downscale_weight)
-    #         for upscale_weight in module.upscale_weights:
-    #             if upscale_weight.requires_grad:
-    #                 special_params.append(upscale_weight)
-
-    #     id_params = [id(p) for p in special_params]
-    #     trainable_params = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad and id(p) not in id_params]
-
-    #     optimizer_grouped_parameters = [
-    #         {
-    #             "params": [p for n, p in trainable_params if not any(nd in n for nd in no_decay)],
-    #             'lr': self.args.learning_rate,
-    #             "weight_decay": self.args.weight_decay,
-    #         },
-    #         {
-    #             "params": [p for n, p in trainable_params if any(nd in n for nd in no_decay)],
-    #             'lr': self.args.learning_rate,
-    #             "weight_decay": 0.0,
-    #         },
-    #         { 'params': special_params, 'lr': self.args.sow_lr, 'weight_decay': self.args.weight_decay}
-    #     ]
-    #     # optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, self.model)
-    #     # self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-    #     self.optimizer = AdamW(optimizer_grouped_parameters)
-    
-    #     return self.optimizer
-
 from dataclasses import dataclass, field
 
 @dataclass
@@ -125,8 +86,8 @@ def train(
         cutoff_len: int = 256,
         val_set_size: int = 2000,
         use_gradient_checkpointing: bool = False,
-        eval_step: int = 5,
-        save_step: int = 5,
+        eval_step: int = 200,
+        save_step: int = 600,
         # lora hyperparams
         lora_r: int = 8,
         lora_alpha: int = 16,
@@ -219,7 +180,7 @@ def train(
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=load_8bit,
-            # torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
             trust_remote_code=True,
         )
@@ -227,7 +188,7 @@ def train(
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=False,
-            # torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
             trust_remote_code=True,
         )
@@ -312,8 +273,6 @@ def train(
             task_type="CAUSAL_LM",
         )
     elif adapter_name == "sow":
-        sow_args = SoWArgs(rank=rank, n_iter=1, device="cuda", dtype=model.dtype, scale=1)
-
         if "llama" in base_model:
             target_modules = [
                 "q_proj", "k_proj", "v_proj", "o_proj",
@@ -322,11 +281,15 @@ def train(
         elif "roberta" in base_model:
             target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
         print("Preparing SoW model")
-        model = prepare_sow(model, target_modules, decompose="keep", args=sow_args)
-        print("SoW model prepared")
-        # model.load_state_dict("/home/antoine/code/tn_gradient/scripts/trained_models")
 
-        # print(model)
+        sow_config = SoWConfig(
+            target_modules=target_modules,
+            rank=rank,
+            device="cuda"
+        )
+        model = prepare_sow(model, sow_config)
+        print("SoW model prepared")
+        
         printer = Printer(TrainableStrategy())
         printer.print(model, display_legend=True)
 
@@ -335,22 +298,6 @@ def train(
     
     if adapter_name == "prefix-tuning":
         model.to('cuda')
-
-    # model.save_pretrained("/home/antoine/code/tn_gradient/scripts/trained_models")
-
-    # print("Saved")
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     "/home/antoine/code/tn_gradient/scripts/trained_models",
-    #     load_in_8bit=False,
-    #     # torch_dtype=torch.float16,
-    #     device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
-    #     trust_remote_code=True,
-    # )
-    # model = prepare_sow(model, target_modules, decompose="keep", args=sow_args)
-    # model.to("cuda")
-    # print("Loaded")
-    # printer = Printer(TrainableStrategy())
-    # printer.print(model, display_legend=True)
 
     if data_path.endswith(".json"):  # todo: support jsonl
         data = load_dataset("json", data_files=data_path)
@@ -421,68 +368,19 @@ def train(
     )
     SpecificTrainer = transformers.Trainer
     
-    no_decay = ["bias", "LayerNorm.weight"]
-    trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
-
-    optimizer_grouped_parameters = [
-        {
-            "params": [p for n, p in trainable_params if not any(nd in n for nd in no_decay)],
-            'lr': learning_rate,
-            "weight_decay": 0.0,
-        },
-        {
-            "params": [p for n, p in trainable_params if any(nd in n for nd in no_decay)],
-            'lr': learning_rate,
-            "weight_decay": 0.0,
-        },
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters)
-    
     if adapter_name == "sow":
-        no_decay = ["bias", "LayerNorm.weight"]
-        special_params = []
-        for module_name, module in model.named_modules():
-            if not isinstance(module, SoWLinear):
-                continue
-
-            if not any(target_key in module_name for target_key in target_modules):
-                continue
-
-            for downscale_weight in module.downscale_weights:
-                if downscale_weight.requires_grad:
-                    special_params.append(downscale_weight)
-            for upscale_weight in module.upscale_weights:
-                if upscale_weight.requires_grad:
-                    special_params.append(upscale_weight)
-
-        id_params = [id(p) for p in special_params]
-        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in id_params]
-
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in trainable_params if not any(nd in n for nd in no_decay)],
-                'lr': learning_rate,
-                "weight_decay": 0.0,
-            },
-            {
-                "params": [p for n, p in trainable_params if any(nd in n for nd in no_decay)],
-                'lr': learning_rate,
-                "weight_decay": 0.0,
-            },
-            { 'params': special_params, 'lr': sow_lr, 'weight_decay': 0.0}
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters)
-
         SpecificTrainer = SoWTrainer
         
+
+        wandb_run_name = f"sow_r_{rank}_freq_{accumulation_steps}_lr_{learning_rate}_slr_{sow_lr}"
         training_args = SoWTrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            bf16=False,
-            fp16=True,
+            bf16=True,
+            fp16=False,
             logging_steps=10,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -502,19 +400,7 @@ def train(
             target_modules=target_modules,
         )
 
-    from math import ceil
     
-    num_update_steps_per_epoch = len(train_data) // training_args.gradient_accumulation_steps
-    max_steps = ceil(training_args.num_train_epochs * num_update_steps_per_epoch)
-    num_warmup_steps = training_args.get_warmup_steps(max_steps)
-    
-    lr_scheduler = get_scheduler(
-        name="linear",
-        optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=max_steps,
-    )
-
     trainer = SpecificTrainer(
         model=model,
         train_dataset=train_data,
@@ -523,7 +409,6 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
-        optimizers=(optimizer, lr_scheduler)
     )
     model.config.use_cache = False
 

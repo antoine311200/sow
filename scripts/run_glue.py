@@ -81,6 +81,7 @@ task_to_keys = {
 
 more_task_to_keys = {
     "google/boolq": ("question", "passage"),
+    "/home/antoine/code/LLM-Adapters/dataset/boolq": ("instruction"),
     "allenai/winogrande": ("sentence", "option1", "option2"),
     "ybisk/piqa": ("goal", "sol1", "sol2"),
     "allenai/social_i_qa": ("context", "question", "answerA", "answerB", "answerC"),
@@ -91,6 +92,7 @@ more_task_to_keys = {
 }
 more_task_to_labels = {
     "google/boolq": ("answer", None),
+    "/home/antoine/code/LLM-Adapters/dataset/boolq": ("answer", ["true", "false"]),
     "allenai/winogrande": ("answer", None),
     "ybisk/piqa": ("label", None),
     "allenai/social_i_qa": ("label", ["1", "2", "3"]),
@@ -291,7 +293,7 @@ def parse_args():
     parser.add_argument("--scale", type=float, default=1)
     parser.add_argument("--init_method", type=str, default="normal_QR")
     parser.add_argument("--accumulation_steps", type=int, default=200)
-    parser.add_argument("--mode", type=str, default='qr')
+    parser.add_argument("--mode", type=str, default='keep')
     parser.add_argument("--sow_lr", type=float, default=5e-5, help="Initial learning rate (after the potential warmup period) to use.")
 
 

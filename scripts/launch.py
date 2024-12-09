@@ -95,34 +95,38 @@ import os
 #     --monitor_memory true")
     # --activation_checkpointing \
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3,4,5,6"
+os.environ["CUDA_VISIBLE_DEVICES"] ="2"
 
-os.system("torchrun --standalone --nproc_per_node 4 ./simple_train.py \
-    --model_config ./configs/llama_350m.json \
-    --lr 0.001 \
-    --batch_size 64 \
-    --total_batch_size 512 \
-    --num_training_steps 50000 \
-    --warmup_steps 0.05 \
-    --weight_decay 0 \
-    --dtype bfloat16 \
-    --scheduler cosine \
-    --save_every 100000 \
-    --single_gpu \
-    --monitor_memory true \
-    --min_lr_ratio 0.03 \
-    --max_length 256 \
-    --optimizer galore_adamw \
-    \
-    --architecture linear \
-    --sow_accumulation 500 \
-    --sow_lr 0.00175 \
-    --init_method kaiming_normal \
-    --sow_scale 1.0 \
-    --rank 100 \
-    --n_iter 1 \
-    \
-    ")
+    # --continue_from ./checkpoints/llama_60m-2024-11-06-11-33-32/model_5000 \
+command = (
+    f"torchrun --standalone --nproc_per_node 1 ./simple_train.py "
+    f"--model_config ./configs/llama_60m.json "
+    f"--lr 0.01 "
+    f"--batch_size 128 "
+    f"--total_batch_size 256 "
+    f"--num_training_steps 25000 "
+    f"--warmup_steps 0.05 "
+    f"--weight_decay 0 "
+    f"--dtype bfloat16 "
+    f"--scheduler cosine "
+    f"--save_every 2500000 "
+    f"--eval_every 999 "
+    f"--single_gpu "
+    f"--monitor_memory true "
+    f"--min_lr_ratio 0.03 "
+    f"--max_length 256 "
+    f"--optimizer adamw "
+
+    f"--architecture sow "
+    f"--sow_accumulation 5000 "
+    f"--sow_lr 0.001 "
+    f"--rank 50 "
+    # f"--wandb_off"
+)
+os.system(command)
+    # --eval \
+    # --wandb_off \
+    # --activation_checkpointing \
     # --lr_decay 0.85 \
     # --reset_scheduler \
     # --accumulate_after_warmup \
@@ -131,8 +135,8 @@ os.system("torchrun --standalone --nproc_per_node 4 ./simple_train.py \
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 # os.system("torchrun --standalone --nproc_per_node 1 ./simple_train.py \
 #     --eval \
-#     --model_config ./configs/llama_350m.json \
-#     --continue_from ./checkpoints/llama_350m-2024-10-06-22-51-56/model_60000\
+#     --model_config ./configs/llama_60m.json \
+#     --continue_from ./checkpoints/llama_60m-2024-10-31-11-37-40/model_260\
 #     --batch_size 96 \
 #     --total_batch_size 768 \
 #     --dtype bfloat16 \
@@ -140,7 +144,7 @@ os.system("torchrun --standalone --nproc_per_node 4 ./simple_train.py \
 #     --seed 3112 \
 #     \
 #     --architecture sow \
-#     --rank 200 \
+#     --rank 100 \
 #     --n_iter 1 \
 #     \
 # ")

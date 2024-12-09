@@ -1,16 +1,46 @@
 import os
 from math import sqrt
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 from tqdm import tqdm
-from tn_gradient.layer.sow import SoWLinear, SoWArgs
+from tn_gradient.layer.sow import SoWLinear
 from tn_gradient.utils import svd_weight
 
+from peft import PeftModel, PeftConfig
+
+
+@dataclass
+class SoWArgs:
+    device: str = None
+    dtype: torch.dtype = None
+
+    init_method: str = "normal_QR"
+
+    rank: int = 16
+    n_iter: int = 5
+    scale: float = 1
+
+class SoWConfig(PeftConfig):
+    def __init__(self, target_modules, rank=16, scale=1.0, device="cpu", init_method="normal_QR", decompose="keep", **kwargs):
+        super().__init__(**kwargs)
+        self.rank = rank
+        self.scale = scale
+        self.target_modules = target_modules
+        self.device = device
+
+        self.init_method = init_method
+        self.decompose = decompose
+
+        self.peft_type = "LORA"
+
+
 def prepare_sow(
-    model, target_modules, decompose: bool = 'qr', args: SoWArgs = SoWArgs()
+    model, config: SoWConfig
+    # target_modules, decompose: bool = 'qr', args: SoWArgs = SoWArgs()
 ):
     """Code for preparing the model for the Sum-of-Weights decomposition.
 
@@ -39,16 +69,16 @@ def prepare_sow(
     """
     layers_to_replace = {}
 
-    max_split = max([len(name.split(".")) for name in target_modules])
+    max_split = max([len(name.split(".")) for name in config.target_modules])
 
     def check_module(name, module):
         split_name = name.split(".")
         if isinstance(module, nn.Linear):
-            if len(split_name) == 1 and split_name[0] in target_modules:
+            if len(split_name) == 1 and split_name[0] in config.target_modules:
                 return True
 
             for i in range(1, min(max_split + 1, len(split_name))):
-                if ".".join(split_name[-i:]) in target_modules:
+                if ".".join(split_name[-i:]) in config.target_modules:
                     return True
         return False
 
@@ -67,7 +97,7 @@ def prepare_sow(
             # # Convertion to float is necessary for the QR decomposition
             # # as CUDA does not support QR decomposition for half precision
             convertion = False
-            if module.weight.data.dtype != torch.float and decompose == "qr":
+            if module.weight.data.dtype != torch.float and config.decompose == "qr":
                 convertion = True
 
                 weight_type = module.weight.data.dtype
@@ -78,19 +108,19 @@ def prepare_sow(
             new_layer = SoWLinear(
                 in_features=module.in_features,
                 out_features=module.out_features,
-                rank=args.rank,
-                n_iter=args.n_iter,
-                scale=args.scale,
-                init_method=args.init_method,
+                rank=config.rank,
+                n_iter=1,
+                scale=config.scale,
+                init_method=config.init_method,
                 bias=module.bias is not None,
                 dtype=module.weight.data.dtype,
-                device=args.device,
-                init_params=decompose!='qr'
+                device=config.device,
+                init_params=config.decompose!='qr'
             )
             new_layer.virtual_rank = min(module.in_features, module.out_features)
 
-            if decompose == 'qr':
-                keep_rank = args.rank * args.n_iter
+            if config.decompose == 'qr':
+                keep_rank = config.rank * 1
                 Q, R = torch.linalg.qr(module.weight.data.T.to("cuda"))
                 Q_major, Q_minor = (
                     Q[:, :-keep_rank],
@@ -103,20 +133,20 @@ def prepare_sow(
 
                 W = Q_major @ R_major
                 W = Q_major @ R_major
-                A = torch.split(Q_minor, args.rank, dim=1)
-                B = torch.split(R_minor, args.rank, dim=0)
+                A = torch.split(Q_minor, config.rank, dim=1)
+                B = torch.split(R_minor, config.rank, dim=0)
 
                 new_layer.downscale_weights.from_weights(A)
                 new_layer.upscale_weights.from_weights(B)
-                # new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
-                new_layer.acc_downweight = nn.Parameter(W.to(args.device).contiguous(), requires_grad=False)
+
+                new_layer.acc_downweight = nn.Parameter(W.to(config.device).contiguous(), requires_grad=False)
 
                 for up_weight in new_layer.upscale_weights:
                     up_weight.require_grad = True
                 for down_weight in new_layer.downscale_weights:
                     down_weight.require_grad = True
-            elif decompose == 'keep':
-                new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(args.device).contiguous(), requires_grad=False)
+            elif config.decompose == 'keep':
+                new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(config.device).contiguous(), requires_grad=False)
 
             if module.bias is not None:
                 new_layer.bias = module.bias
@@ -140,6 +170,12 @@ def prepare_sow(
             pbar.update(1)
 
     return model
+
+class SoWModel(PeftModel):
+    def __init__(self, model, config: SoWConfig):
+        # super().__init__(model, config)
+        self.config = config
+        self.model = prepare_sow(model, config)
 
 
 def load_sow(model, checkpoint_path):

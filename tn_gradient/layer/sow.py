@@ -1,25 +1,15 @@
 import torch
 import torch.nn as nn
 
-from opt_einsum import contract_expression, contract_path
 
 from math import sqrt
 from typing import List
 
 from dataclasses import dataclass
 
-from tn_gradient.utils import qr_weight, perturbe_random, randhaar, randuptri
+from peft import PeftConfig
 
-@dataclass
-class SoWArgs:
-    device: str = None
-    dtype: torch.dtype = None
-
-    init_method: str = "normal_QR"
-
-    rank: int = 16
-    n_iter: int = 5
-    scale: float = 1
+from tn_gradient.utils import qr_weight
 
 
 class SoWParameter(nn.ParameterList):
