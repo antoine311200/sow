@@ -42,6 +42,9 @@ from utils.args_utils import check_args_torchrun_main
 from utils.training_utils import get_all_schedulers, reset_optimizer
 from utils.memory_utils import calculate_optimizer_memory_usage, calculate_weight_usage
 
+from tn_gradient.utils import __colorized_str__
+torch.nn.Module.__str__ = __colorized_str__
+
 from galore_torch import GaLoreAdamW
 
 def parse_args(args):
@@ -438,16 +441,16 @@ def main(args):
         wandb.save(os.path.abspath(__file__), policy="now")
         pbar = tqdm(total=args.num_training_steps - update_step, desc="Update steps", ncols=80)
 
-    memory_usage, memory_usage_sow, memory_usage_accum = calculate_weight_usage(model)
+    memory_usage, memory_usage_sow, memory_usage_accum, memory_buffer = calculate_weight_usage(model)
     memory_train_usage = sum(p.nelement() * p.element_size() for p in model.parameters() if p.requires_grad)
 
     logger.info(f"\n{model}\n")
     logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
     logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
     logger.info(f"Trainable params: {memory_train_usage / (1024 * 1024):.2f}MiB")
+    logger.info(f"Buffer params: {memory_buffer / (1024 * 1024):.2f}MiB")
     if args.architecture == "sow":
         logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
-
 
     if args.optimizer.lower() == "galore_adamw":
         optimizer = GaLoreAdamW([

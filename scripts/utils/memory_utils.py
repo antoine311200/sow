@@ -37,10 +37,12 @@ def calculate_weight_usage(model):
     memory_usage_sow = 0
     memory_usage_accum = 0
     memory_usage = 0#sum(p.numel() for p in model.parameters())
-    
+    buffer_size = 0
     for param in model.parameters():
-        if isinstance(param, torch.Tensor):
-            memory_usage += param.nelement() * param.element_size()
+        # if isinstance(param, torch.Tensor):
+        memory_usage += param.nelement() * param.element_size()
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
 
     for _, module in model.named_modules():
         if isinstance(module, SoWLinear):
@@ -51,4 +53,4 @@ def calculate_weight_usage(model):
             
             memory_usage_accum += module.in_features * module.out_features
     
-    return memory_usage, memory_usage_sow, memory_usage_accum
+    return memory_usage, memory_usage_sow, memory_usage_accum, buffer_size

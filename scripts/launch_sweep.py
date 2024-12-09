@@ -43,12 +43,13 @@ def worker(job_queue, gpu_id):
             break
 
 if __name__ == "__main__":
-    gpu_ids = [0, 1, 2, 3]
+    gpu_ids = [7, 8, 9]
     
-    ranks = [25, 50, 100, 200]
+    ranks = [200, 25]
     accs = [500, 1000, 2000, 5000]
     lrs = [0.01, 0.005, 0.001]
-    sow_lrs = [0.01, 0.005, 0.001]
+    sow_lrs = [0.0005, 0.001]
+
     param_combinations = list(product(ranks, accs, lrs, sow_lrs))
     print(f"Launching sweep with {len(param_combinations)} runs")
     

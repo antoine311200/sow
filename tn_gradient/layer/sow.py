@@ -1,25 +1,15 @@
 import torch
 import torch.nn as nn
 
-from opt_einsum import contract_expression, contract_path
 
 from math import sqrt
 from typing import List
 
 from dataclasses import dataclass
 
-from tn_gradient.utils import qr_weight, perturbe_random, randhaar, randuptri
+from peft import PeftConfig
 
-@dataclass
-class SoWArgs:
-    device: str = None
-    dtype: torch.dtype = None
-
-    init_method: str = "normal_QR"
-
-    rank: int = 16
-    n_iter: int = 5
-    scale: float = 1
+from tn_gradient.utils import qr_weight
 
 
 class SoWParameter(nn.ParameterList):
@@ -60,7 +50,7 @@ class SoWLinear(nn.Module):
         out_features: int,
         bias: bool = True,
         rank: int = 16,
-        n_iter: int = 5,
+        n_iter: int = 1,
         scale: float = 1,
         init_method: str = "normal_QR",
         device=None,
@@ -159,7 +149,7 @@ class SoWLinear(nn.Module):
             
             self.virtual_rank = min(self.virtual_rank + self.rank * self.n_iter, self.in_features, self.out_features)
         else:
-            self.acc_downweight = nn.Parameter(accumalation, requires_grad=False)
+            self.acc_downweight = nn.Parameter(accumalation.contiguous(), requires_grad=False)
             self.acc_upweight = nn.Parameter(torch.empty(0), requires_grad=False)
 
         torch.cuda.empty_cache()
