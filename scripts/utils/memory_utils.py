@@ -36,10 +36,9 @@ def calculate_batch_memory_usage(batch, labels):
 def calculate_weight_usage(model):
     memory_usage_sow = 0
     memory_usage_accum = 0
-    memory_usage = 0#sum(p.numel() for p in model.parameters())
+    memory_usage = 0
     buffer_size = 0
     for param in model.parameters():
-        # if isinstance(param, torch.Tensor):
         memory_usage += param.nelement() * param.element_size()
     for buffer in model.buffers():
         buffer_size += buffer.nelement() * buffer.element_size()
@@ -51,6 +50,6 @@ def calculate_weight_usage(model):
             for weight in module.downscale_weights:
                 memory_usage_sow += weight.nelement() * weight.element_size()
             
-            memory_usage_accum += module.in_features * module.out_features
+            memory_usage_accum += module.in_features * module.out_features * weight.element_size()
     
     return memory_usage, memory_usage_sow, memory_usage_accum, buffer_size

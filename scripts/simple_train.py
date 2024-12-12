@@ -34,8 +34,8 @@ from loguru import logger
 
 from tn_gradient.optimizer.ttsgd import TTSGD
 from tn_gradient.tt import TensorTrain
-from tn_gradient.layer.sow import SoWLinear, SoWArgs
-from tn_gradient.prepare import prepare_sow, accumulate, load_sow
+from tn_gradient.layer.sow import SoWLinear
+from tn_gradient.prepare import prepare_sow, accumulate, load_sow, SoWConfig
 
 from utils.dataloader import PreprocessedIterableDataset, batch_fn
 from utils.args_utils import check_args_torchrun_main
@@ -311,22 +311,23 @@ def main(args):
     model = AutoModelForCausalLM.from_config(model_config)
     
     if args.architecture == "sow" or args.architecture == "lora":
-        sow_args = SoWArgs(
-            rank=args.rank,
-            n_iter=args.n_iter,
-            init_method=args.init_method,
-            scale=args.sow_scale,
-            dtype=args.dtype,
-            device=device,
-        )
-
+        
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-        logger.info("Preparing SoW model")
-        model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
-        logger.info("SoW model prepared")
+        sow_config = SoWConfig(
+            target_modules=target_modules,
+            rank=args.rank,
+            init_method=args.init_method,
+            scale=args.sow_scale,
+            decompose=None,
+            device="cuda"
+        )
 
-        print(model.model.layers[1].self_attn.q_proj.downscale_weights[0].data)
+
+        logger.info("Preparing SoW model")
+        model = prepare_sow(model, sow_config)
+        # model = prepare_sow(model, target_modules, decompose=False, args=sow_args)
+        logger.info("SoW model prepared")
 
         if args.architecture == "lora":
             from math import sqrt
@@ -445,10 +446,12 @@ def main(args):
     memory_train_usage = sum(p.nelement() * p.element_size() for p in model.parameters() if p.requires_grad)
 
     logger.info(f"\n{model}\n")
-    logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB")
-    logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB")
-    logger.info(f"Trainable params: {memory_train_usage / (1024 * 1024):.2f}MiB")
+    logger.info(f"Total params (start): {memory_usage / (1024 * 1024):.2f}MiB [{memory_usage / 1e6}Mb]")
+    logger.info(f"Total params (end): {(memory_usage + memory_usage_accum) / (1024 * 1024):.2f}MiB (+{memory_usage_accum/ (1024 * 1024):.2f}MiB)")
+    logger.info(f"Trainable params: {memory_train_usage / (1024 * 1024):.2f}MiB [{memory_train_usage / 1e6}Mb]")
     logger.info(f"Buffer params: {memory_buffer / (1024 * 1024):.2f}MiB")
+    # logger.info(f": {(memory_usage + memory_usage_accum + memory_train_usage) / (1024 * 1024):.2f}MiB")
+
     if args.architecture == "sow":
         logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
 
@@ -592,7 +595,7 @@ def main(args):
         if args.grad_clipping != 0.0: torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clipping)
 
         if global_rank == 0: pbar.update(1)
-        if update_step == 50:
+        if update_step == 10: # 50
             
             # Get the optimizer memory usage
             optimizer_memory_usage, _ = calculate_optimizer_memory_usage(optimizer)
@@ -600,6 +603,9 @@ def main(args):
             full_optimizer_memory_usage = full_optimizer_memory_usage / (1024 * 1024)
             
             logger.info(f"Optimizer memory usage: {full_optimizer_memory_usage:.2f} MiB")
+
+            # import sys
+            # sys.exit()
 
         optimizer.step()
         optimizer.zero_grad()
@@ -634,7 +640,7 @@ def main(args):
 
         lr = optimizer.param_groups[0]["lr"]
         sow_lr = optimizer.param_groups[1]["lr"] if args.architecture == "sow" else None
-        
+
         tokens_in_update = tokens_seen - tokens_seen_before
         tokens_seen_before = tokens_seen
 

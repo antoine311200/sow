@@ -13,16 +13,16 @@ from tn_gradient.utils import svd_weight
 from peft import PeftModel, PeftConfig
 
 
-@dataclass
-class SoWArgs:
-    device: str = None
-    dtype: torch.dtype = None
+# @dataclass
+# class SoWArgs:
+#     device: str = None
+#     dtype: torch.dtype = None
 
-    init_method: str = "normal_QR"
+#     init_method: str = "normal_QR"
 
-    rank: int = 16
-    n_iter: int = 5
-    scale: float = 1
+#     rank: int = 16
+#     n_iter: int = 5
+#     scale: float = 1
 
 class SoWConfig(PeftConfig):
     def __init__(self, target_modules, rank=16, scale=1.0, device="cpu", init_method="normal_QR", decompose="keep", **kwargs):
@@ -146,7 +146,11 @@ def prepare_sow(
                 for down_weight in new_layer.downscale_weights:
                     down_weight.require_grad = True
             elif config.decompose == 'keep':
-                new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(config.device).contiguous(), requires_grad=False)
+                try:
+                    new_layer.acc_downweight = nn.Parameter(module.weight.data.T.to(config.device).contiguous(), requires_grad=False)
+                except:
+                    new_layer.acc_downweight = nn.Parameter(torch.empty(module.weight.data.T.shape), requires_grad=False)
+                    print(f"Found issue with copying module `{name}`, setting empty param...")
 
             if module.bias is not None:
                 new_layer.bias = module.bias
@@ -163,7 +167,10 @@ def prepare_sow(
             else:
                 setattr(model, name, new_layer)
             
-            module.to("cpu")
+            try:
+                module.to("cpu")
+            except:
+                pass
             del module
             torch.cuda.empty_cache()
             
