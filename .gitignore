@@ -51,7 +51,7 @@ l10n/
 python-env-tools/**
 # Remove egg-info
 **/*.egg-info
-notebooks/
+notebooks/misc/
 wandb
 checkpoints
 *.pickle
