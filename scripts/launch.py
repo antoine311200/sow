@@ -95,23 +95,24 @@ import os
 #     --monitor_memory true")
     # --activation_checkpointing \
 
-os.environ["CUDA_VISIBLE_DEVICES"] ="2"
+os.environ["CUDA_VISIBLE_DEVICES"] ="3,4,5"
 
     # --continue_from ./checkpoints/llama_60m-2024-11-06-11-33-32/model_5000 \
 command = (
-    f"torchrun --standalone --nproc_per_node 1 ./simple_train.py "
-    f"--model_config ./configs/llama_60m.json "
-    f"--lr 0.01 "
-    f"--batch_size 128 "
-    f"--total_batch_size 256 "
-    f"--num_training_steps 25000 "
+    f"torchrun --standalone --nproc_per_node 3 ./simple_train.py "
+    f"--model_config ./configs/llama_1b.json "
+    f"--lr 0.0001 "
+    # f"--activation_checkpointing "
+    f"--batch_size 48 "
+    f"--total_batch_size 192 "
+    f"--num_training_steps 200000 "
     f"--warmup_steps 0.05 "
     f"--weight_decay 0 "
     f"--dtype bfloat16 "
     f"--scheduler cosine "
     f"--save_every 2500000 "
-    f"--eval_every 999 "
-    f"--single_gpu "
+    f"--eval_every 3999 "
+    # f"--single_gpu "
     f"--monitor_memory true "
     f"--min_lr_ratio 0.03 "
     f"--max_length 256 "
@@ -119,8 +120,8 @@ command = (
 
     f"--architecture sow "
     f"--sow_accumulation 5000 "
-    f"--sow_lr 0.001 "
-    f"--rank 50 "
+    f"--sow_lr 0.00025 "
+    f"--rank 200 "
     # f"--wandb_off"
 )
 os.system(command)

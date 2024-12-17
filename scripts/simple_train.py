@@ -584,8 +584,10 @@ def main(args):
         offset = (int(args.warmup_steps * args.num_training_steps) if args.accumulate_after_warmup else 0)
         accumulation_step = int(args.gradient_accumulation * args.sow_accumulation)
 
-        if global_step % args.gradient_accumulation and update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
-            logger.info(f"Accumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
+        # print(global_step % args.gradient_accumulation, update_step, offset, (update_step - offset) % accumulation_step)
+
+        if (global_step % args.gradient_accumulation or args.gradient_accumulation == 1) and update_step > offset and (update_step - offset) % accumulation_step == 0 and args.architecture == "sow":
+            logger.info(f"\nAccumulation & Reset optimizer states (step global: {global_step} - local: {update_step})")
             accumulate(model)
             reset_optimizer(optimizer, group_id=1) # reset the second parameter group    
 
