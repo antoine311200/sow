@@ -27,6 +27,7 @@ from peft import (  # noqa: E402
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, AutoModel, get_scheduler  # noqa: F402
 
+import wandb
 
 from tn_gradient.layer.sow import SoWLinear
 from tn_gradient.prepare import prepare_sow, SoWConfig
@@ -47,9 +48,16 @@ class SoWTrainer(transformers.Trainer):
 
         self.accelerator.backward(loss)
 
+        if getattr(self, "freq_step", None):
+            self.freq_step += 1
+        else:
+            self.freq_step = 1
+
         if (
             self.state.global_step > 0 and
-            self.state.global_step % self.args.accumulation_steps == 0
+            self.state.global_step % self.args.accumulation_steps == 0 and
+            self.freq_step % self.args.accumulation_steps == 0 and 
+            self.freq_step > 0
         ):
             print(f"Accumulation, Scaling & Reset optimizer states (step {self.state.global_step})")
 
@@ -59,6 +67,12 @@ class SoWTrainer(transformers.Trainer):
                     module.accumulate()
                     module.scale = scaling
             reset_optimizer(self.optimizer, group_id=2) # reset the second parameter group
+            self.freq_step = 1
+
+        wandb.log({
+            "train_loss": loss.detach().item(),
+            "step": self.state.global_step,
+        })
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
@@ -87,7 +101,7 @@ def train(
         val_set_size: int = 2000,
         use_gradient_checkpointing: bool = False,
         eval_step: int = 200,
-        save_step: int = 600,
+        save_step: int = 400000,
         # lora hyperparams
         lora_r: int = 8,
         lora_alpha: int = 16,
@@ -175,6 +189,9 @@ def train(
         os.environ["WANDB_WATCH"] = wandb_watch
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
+    # os.environ["WANDB_CAPTURE_OUTPUT"] = "true"
+    # os.environ["WANDB_WATCH"] = "all"
 
     if load_8bit:
         model = AutoModelForCausalLM.from_pretrained(
@@ -273,10 +290,11 @@ def train(
             task_type="CAUSAL_LM",
         )
     elif adapter_name == "sow":
-        if "llama" in base_model:
+        if "llama" in base_model.lower():
             target_modules = [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
+                "q_proj", "k_proj", "v_proj",
+                # "o_proj", "gate_proj",
+                "up_proj", "down_proj"
             ]
         elif "roberta" in base_model:
             target_modules = ["query", "key", "value", "output.dense", "intermediate.dense"]
@@ -369,19 +387,52 @@ def train(
     SpecificTrainer = transformers.Trainer
     
     if adapter_name == "sow":
+        no_decay = ["bias", "LayerNorm.weight"]
+        special_params = []
+        for module_name, module in model.named_modules():
+            if not isinstance(module, SoWLinear):
+                continue
+
+            if not any(target_key in module_name for target_key in target_modules):
+                continue
+
+            for downscale_weight in module.downscale_weights:
+                if downscale_weight.requires_grad:
+                    special_params.append(downscale_weight)
+            for upscale_weight in module.upscale_weights:
+                if upscale_weight.requires_grad:
+                    special_params.append(upscale_weight)
+
+        id_params = [id(p) for p in special_params]
+        trainable_params = [(n, p) for n, p in model.named_parameters() if p.requires_grad and id(p) not in id_params]
+
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in trainable_params if not any(nd in n for nd in no_decay)],
+                'lr': learning_rate,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": [p for n, p in trainable_params if any(nd in n for nd in no_decay)],
+                'lr': learning_rate,
+                "weight_decay": 0.0,
+            },
+            { 'params': special_params, 'lr': sow_lr, 'weight_decay': 0.0}
+        ]
+        optimizer = AdamW(optimizer_grouped_parameters)
+
         SpecificTrainer = SoWTrainer
         
-
         wandb_run_name = f"sow_r_{rank}_freq_{accumulation_steps}_lr_{learning_rate}_slr_{sow_lr}"
         training_args = SoWTrainingArguments(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
+            warmup_steps=50,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             bf16=True,
             fp16=False,
-            logging_steps=10,
+            logging_steps=100,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
@@ -400,7 +451,19 @@ def train(
             target_modules=target_modules,
         )
 
+    from math import ceil
     
+    num_update_steps_per_epoch = len(train_data) // training_args.gradient_accumulation_steps
+    max_steps = ceil(training_args.num_train_epochs * num_update_steps_per_epoch)
+    num_warmup_steps = training_args.get_warmup_steps(max_steps)
+    
+    lr_scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=max_steps,
+    )
+
     trainer = SpecificTrainer(
         model=model,
         train_dataset=train_data,
@@ -409,6 +472,7 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
+        optimizers=(optimizer, lr_scheduler)
     )
     model.config.use_cache = False
 
@@ -425,6 +489,7 @@ def train(
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     model.save_pretrained(output_dir)
+    torch.save(training_args, os.path.join(output_dir, "training_args.bin"))
 
     print(
         "\n If there's a warning about missing keys above, please disregard :)"

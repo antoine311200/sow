@@ -103,11 +103,14 @@ def main(
     output_data = []
     pbar = tqdm(total=total)
     accuracies = []
+
+    model.eval()
     for idx, batch in enumerate(batches):
         current += len(batch)
         instructions = [data.get('instruction') for data in batch]
 
         outputs = evaluate(instructions)
+        current_correct = 0
 
         for data, output in zip(batch, outputs):
             label = data.get('answer')
@@ -115,25 +118,24 @@ def main(
             predict = extract_answer(args, output)
             if label == predict:
                 correct += 1
+                current_correct += 1
                 flag = True
-            new_data = copy.deepcopy(data)
-            new_data['output_pred'] = output
-            new_data['pred'] = predict
-            new_data['flag'] = flag
-            output_data.append(new_data)
-            # print(data["instruction"])
-            # print(output)
-            # print('prediction:', predict)
-            # print('label:', label)
+            # new_data = copy.deepcopy(data)
+            # # new_data['output_pred'] = output
+            # # new_data['pred'] = predict
+            # # new_data['flag'] = flag
+            # output_data.append(new_data)
         print('---------------')
-        print(f'\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / current}')
+        print(f'\rtest:{idx + 1}/{total} | batch_accuracy {current_correct}/{len(batch)} =>  {current_correct / len(batch)} ({correct / current})')
+        # print([(label, data['pred']) for data in output_data])
         accuracies.append(correct / current)
         print('---------------')
         with open(save_file, 'w+') as f:
             json.dump(output_data, f, indent=4)
+        torch.cuda.empty_cache()
         pbar.update(1)
     pbar.close()
-    print("Accuracy:",  sum(accuracies)/len(accuracies))
+    print("Accuracy:",  accuracies[-1])
     print('\n')
     print('test finished')
 
@@ -254,17 +256,39 @@ def load_model(args) -> tuple:
             )
         else:
             config = AutoConfig.from_pretrained(base_model)
-            model = AutoModelForCausalLM.from_config(config)
-            args = torch.load(os.path.join(base_model, "training_args.bin"))
-            sow_config = SoWConfig(
-                target_modules=args.target_modules,
-                rank=args.rank,
-                device="cuda"
+            print(config._name_or_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                'yahma/llama-7b-hf', #config._name_or_path,
+                load_in_8bit=False,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
             )
+            try:
+                args = torch.load(os.path.join(base_model, "training_args.bin"))
+                sow_config = SoWConfig(
+                    target_modules=args.target_modules,
+                    rank=args.rank,
+                    device="cuda"
+                )
+            except:
+                print("NO TRAINING ARGS")
+                sow_config = SoWConfig(
+                    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                    rank=10,
+                    device="cuda"
+                )
             model = prepare_sow(model, sow_config)
-            model.load_state_dict(load_and_merge_safetensors(base_model))
-            print("Loaded")
-        # print(model)
+            model.load_state_dict(load_and_merge_safetensors(base_model), assign=True)
+            model = model.to("cuda")
+            model.half()
+            model.eval()
+            if torch.__version__ >= "2" and sys.platform != "win32":
+                model = torch.compile(model)
+
+            from torchcolor.printer import Printer
+            Printer("trainable").print(model)
+
     elif device == "mps":
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
