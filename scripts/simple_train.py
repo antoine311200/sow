@@ -406,8 +406,6 @@ def main(args):
 
         for module_name, module in model.named_modules():
             logger.info(f"Module name: {module_name}")
-            if not isinstance(module, SoWLinear):
-                continue
 
             if not any(target_key in module_name for target_key in target_modules):
                 continue
