@@ -405,7 +405,6 @@ def main(args):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
         for module_name, module in model.named_modules():
-            logger.info(f"Module name: {module_name}")
 
             if not any(target_key in module_name for target_key in target_modules):
                 continue
