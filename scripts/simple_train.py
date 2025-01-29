@@ -392,7 +392,7 @@ def main(args):
 
             if not any(target_key in module_name for target_key in target_modules):
                 continue
-            
+
             for downscale_weight in module.downscale_weights:
                 special_params.append(downscale_weight)
             for upscale_weight in module.upscale_weights:
@@ -410,12 +410,12 @@ def main(args):
                 continue
 
             special_params.append(module.weight)
-            
+
         id_params = [id(p) for p in special_params]
         trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
     else:
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-    
+
     if args.activation_checkpointing:
         model.gradient_checkpointing_enable()
 
@@ -456,6 +456,8 @@ def main(args):
         logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
 
     if args.optimizer.lower() == "galore_adamw":
+        logger.info(f"Trainable params (GaLoRe): {len(trainable_params)}")
+        logger.info(f"Special params (GaLoRe): {len(special_params)}")
         optimizer = GaLoreAdamW([
             {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
             {
