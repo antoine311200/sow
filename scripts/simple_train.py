@@ -385,6 +385,7 @@ def main(args):
 
     special_params = []
     if args.architecture == "sow" or args.architecture == "lora":
+        logger.info("Getting LoRA parameters")
 
         for module_name, module in model.named_modules():
             if not isinstance(module, SoWLinear):
@@ -400,11 +401,10 @@ def main(args):
         id_params = [id(p) for p in special_params]
         trainable_params = [p for p in model.parameters() if p.requires_grad and id(p) not in id_params]
     elif args.architecture == "galore":
+        logger.info("Getting GaLore parameters")
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
         for module_name, module in model.named_modules():
-            if not isinstance(module, SoWLinear):
-                continue
 
             if not any(target_key in module_name for target_key in target_modules):
                 continue
