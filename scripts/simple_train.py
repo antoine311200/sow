@@ -98,8 +98,8 @@ def parse_args(args):
     parser.add_argument("--update_proj_gap", type=int, default="200")
     parser.add_argument("--galore_scale", type=float, default="0.25")
     parser.add_argument("--proj_type", type=str, default="std")
-    parser.add_argument("--beta_1", type=float, default="0")
-    parser.add_argument("--beta_2", type=float, default="0")
+    parser.add_argument("--beta1", type=float, default="0")
+    parser.add_argument("--beta2", type=float, default="0")
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
 
