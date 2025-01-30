@@ -45,7 +45,7 @@ from utils.memory_utils import calculate_optimizer_memory_usage, calculate_weigh
 from tn_gradient.utils import __colorized_str__
 torch.nn.Module.__str__ = __colorized_str__
 
-from galore_torch import GaLoreAdamW
+from galore_torch import GaLoreAdamW, GaLoreAdafactor
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -467,6 +467,28 @@ def main(args):
                 'scale': args.galore_scale, 'proj_type': args.proj_type
             }
         ])
+    elif args.optimizer.lower() == "galore_adafactor":
+        args.beta1 = None if args.beta1 == 0.0 else args.beta1
+        optimizer = GaLoreAdafactor(
+            [
+                {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+                {
+                    'params': special_params, 
+                    'lr': args.sow_lr, 'weight_decay': args.weight_decay, 
+                    'rank': args.galore_rank, 'update_proj_gap': args.update_proj_gap,
+                    'scale': args.galore_scale, 'proj_type': args.proj_type
+                }
+            ],
+            lr=args.lr,
+            eps=(1e-30, 1e-3),
+            clip_threshold=1.0,
+            decay_rate=-0.8,
+            beta1=args.beta1,
+            weight_decay=args.weight_decay,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
     elif args.optimizer.lower() == "AdamW".lower():
         optimizer = torch.optim.AdamW([
             {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
