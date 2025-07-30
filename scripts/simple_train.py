@@ -102,6 +102,7 @@ def parse_args(args):
     parser.add_argument("--beta2", type=float, default="0")
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
+    parser.add_argument("--cpu", default=False, action="store_true")
 
     args = parser.parse_args(args)
 
@@ -221,14 +222,14 @@ def main(args):
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)    
+    torch.cuda.set_device(local_rank)
 
     logger.info(f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}")
 
     dist.init_process_group(backend="nccl", rank=global_rank, world_size=world_size)
 
     logger.info("Process group initialized")
-    device = f"cuda:{local_rank}"
+    device = "cpu" if args.cpu else f"cuda:{local_rank}"
 
     if args.gradient_accumulation is None:
         args.gradient_accumulation = args.total_batch_size // (args.batch_size * world_size)
