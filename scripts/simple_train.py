@@ -462,10 +462,12 @@ def main(args):
         logger.info(f"Special params: {len(special_params)} with {special_memory_usage / (1024 * 1024):.2f}MiB")
 
     if args.optimizer.lower() == "galore_adamw":
-        logger.info(f"Trainable params (GaLoRe): {len(trainable_params)}")
+        # logger.info(f"Trainable params (GaLoRe): {len(trainable_params)}")
         # logger.info(f"Special params (GaLoRe): {len(special_params)}")
 
+        trainable_memory_usage = sum((p.shape[0] + 2 * p.shape[1]) * args.galore_rank * p.element_size() for p in trainable_params)
         special_memory_usage = sum((p.shape[0] + 2 * p.shape[1]) * args.galore_rank * p.element_size() for p in special_params)
+        logger.info(f"Trainable params (GaLoRe): {len(trainable_params)} with {trainable_memory_usage / (1024 * 1024):.2f}MiB")
         logger.info(f"Special params (GaLoRe): {len(special_params)} with {special_memory_usage / (1024 * 1024):.2f}MiB")
 
         optimizer = GaLoreAdamW([
