@@ -458,9 +458,16 @@ def main(args):
     if args.architecture == "sow":
         logger.info(f"SoW params: {memory_usage_sow / (1024 * 1024):.2f}MiB")
 
+        special_memory_usage = sum((p.shape[0] + p.shape[1]) * args.rank * p.element_size() for p in special_params)
+        logger.info(f"Special params: {len(special_params)} with {special_memory_usage / (1024 * 1024):.2f}MiB")
+
     if args.optimizer.lower() == "galore_adamw":
         logger.info(f"Trainable params (GaLoRe): {len(trainable_params)}")
-        logger.info(f"Special params (GaLoRe): {len(special_params)}")
+        # logger.info(f"Special params (GaLoRe): {len(special_params)}")
+
+        special_memory_usage = sum((p.shape[0] + 2 * p.shape[1]) * args.galore_rank * p.element_size() for p in special_params)
+        logger.info(f"Special params (GaLoRe): {len(special_params)} with {special_memory_usage / (1024 * 1024):.2f}MiB")
+
         optimizer = GaLoreAdamW([
             {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
             {
