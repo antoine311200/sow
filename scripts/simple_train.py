@@ -45,7 +45,7 @@ from utils.memory_utils import calculate_optimizer_memory_usage, calculate_weigh
 from tn_gradient.utils import __colorized_str__
 torch.nn.Module.__str__ = __colorized_str__
 
-from galore_torch import GaLoreAdamW
+from galore_torch import GaLoreAdamW, GaLoreAdafactor
 
 def parse_args(args):
     parser = argparse.ArgumentParser()
@@ -98,8 +98,11 @@ def parse_args(args):
     parser.add_argument("--update_proj_gap", type=int, default="200")
     parser.add_argument("--galore_scale", type=float, default="0.25")
     parser.add_argument("--proj_type", type=str, default="std")
+    parser.add_argument("--beta1", type=float, default="0")
+    parser.add_argument("--beta2", type=float, default="0")
 
     parser.add_argument("--single_gpu", default=False, action="store_true")
+    parser.add_argument("--cpu", default=False, action="store_true")
 
     args = parser.parse_args(args)
 
@@ -219,14 +222,14 @@ def main(args):
     global_rank = int(os.environ['RANK'])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(local_rank)    
+    torch.cuda.set_device(local_rank)
 
     logger.info(f"Global rank {global_rank}, local rank {local_rank}, device: {torch.cuda.current_device()}")
 
     dist.init_process_group(backend="nccl", rank=global_rank, world_size=world_size)
 
     logger.info("Process group initialized")
-    device = f"cuda:{local_rank}"
+    device = "cpu" if args.cpu else f"cuda:{local_rank}"
 
     if args.gradient_accumulation is None:
         args.gradient_accumulation = args.total_batch_size // (args.batch_size * world_size)
@@ -467,6 +470,28 @@ def main(args):
                 'scale': args.galore_scale, 'proj_type': args.proj_type
             }
         ])
+    elif args.optimizer.lower() == "galore_adafactor":
+        args.beta1 = None if args.beta1 == 0.0 else args.beta1
+        optimizer = GaLoreAdafactor(
+            [
+                {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+                {
+                    'params': special_params, 
+                    'lr': args.sow_lr, 'weight_decay': args.weight_decay, 
+                    'rank': args.galore_rank, 'update_proj_gap': args.update_proj_gap,
+                    'scale': args.galore_scale, 'proj_type': args.proj_type
+                }
+            ],
+            lr=args.lr,
+            eps=(1e-30, 1e-3),
+            clip_threshold=1.0,
+            decay_rate=-0.8,
+            beta1=args.beta1,
+            weight_decay=args.weight_decay,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
     elif args.optimizer.lower() == "AdamW".lower():
         optimizer = torch.optim.AdamW([
             {'params': trainable_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
